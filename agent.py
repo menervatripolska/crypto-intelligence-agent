@@ -898,25 +898,10 @@ def _index_html() -> str:
 </body></html>"""
 
 
-def start_dashboard(port: int = 8080):
-    server = HTTPServer(("0.0.0.0", port), DashboardHandler)
-    t = threading.Thread(target=server.serve_forever, daemon=True)
-    t.start()
-    log.info(f"Dashboard running on http://0.0.0.0:{port}")
-
-
-def main():
-    log.info("=" * 60)
-    log.info("Claude-Brain Trading Agent — Starting")
-    log.info("=" * 60)
-
-    port = int(os.environ.get("PORT", 8080))
-    start_dashboard(port)
-
+def trading_loop():
     memory   = load_memory()
     cycle    = 0
 
-    # Startup: immediately evaluate all open positions
     log.info("Startup sync: fetching live positions...")
     live_positions = fetch_positions()
     sync_positions(memory, live_positions)
@@ -930,30 +915,21 @@ def main():
         log.info(f"\n{'='*60}\nCycle {cycle} | {ts}\n{'='*60}")
 
         try:
-            # 1. Account + positions
             account   = fetch_balance()
             positions = fetch_positions()
             log.info(f"Balance: ${account.get('equity', 0):.2f} equity | ${account.get('available', 0):.2f} available")
             log.info(f"Open positions: {len(positions)}")
 
-            # 2. Sync memory with reality
             sync_positions(memory, positions)
 
-            # 3. Collect market data
             open_symbols = {p["symbol"] for p in positions}
             market_data  = collect_all_market_data(open_symbols)
             log.info(f"Market data collected: {market_data.get('total_pairs')} total pairs, {len(market_data.get('deep_data', {}))} deep")
 
-            # 4. Analytics
             analytics = compute_analytics(memory.get("trades", []))
-
-            # 5. Ask Claude
-            decision = ask_claude(market_data, account, positions, analytics, memory, cycle)
-
-            # 6. Execute
+            decision  = ask_claude(market_data, account, positions, analytics, memory, cycle)
             execute_action(decision, account, positions, memory)
 
-            # 7. Save + log
             save_memory(memory)
             append_agent_log(cycle, decision, analytics)
 
@@ -964,6 +940,23 @@ def main():
         sleep_for = max(0, CYCLE_SECONDS - elapsed)
         log.info(f"Cycle {cycle} done in {elapsed:.0f}s. Next in {sleep_for/60:.1f} min...")
         time.sleep(sleep_for)
+
+
+def main():
+    log.info("=" * 60)
+    log.info("Claude-Brain Trading Agent — Starting")
+    log.info("=" * 60)
+
+    port = int(os.environ.get("PORT", 8080))
+
+    # Trading loop in background thread; HTTP server owns main thread for Railway health checks
+    t = threading.Thread(target=trading_loop, daemon=True, name="trading-loop")
+    t.start()
+    log.info("Trading loop started in background thread")
+
+    log.info(f"Dashboard running on http://0.0.0.0:{port}")
+    server = HTTPServer(("0.0.0.0", port), DashboardHandler)
+    server.serve_forever()
 
 
 if __name__ == "__main__":
