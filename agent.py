@@ -166,24 +166,28 @@ def place_order(symbol: str, side: str, size: str) -> dict:
 
 
 def place_tpsl(symbol: str, hold_side: str, tp: str, sl: str):
-    """Set TP/SL on an open position via dedicated endpoint (required for market orders)."""
+    """Set TP and SL on an open position via dedicated endpoint (required for market orders)."""
+    # SL order
     api_post("/api/v2/mix/order/place-tpsl-order", {
-        "symbol":        symbol,
-        "productType":   PRODUCT_TYPE,
-        "marginCoin":    "USDT",
-        "planType":      "pos_loss",   # covers both TP and SL
-        "holdSide":      hold_side,    # "long" | "short"
-        "triggerPrice":  sl,
-        "triggerType":   "mark_price",
+        "symbol":       symbol,
+        "productType":  PRODUCT_TYPE,
+        "marginCoin":   "USDT",
+        "planType":     "loss",          # "loss" = stop-loss
+        "holdSide":     hold_side,       # "long" | "short"
+        "triggerPrice": sl,
+        "triggerType":  "mark_price",
+        "executePrice": "0",             # 0 = market execution
     })
+    # TP order
     api_post("/api/v2/mix/order/place-tpsl-order", {
-        "symbol":        symbol,
-        "productType":   PRODUCT_TYPE,
-        "marginCoin":    "USDT",
-        "planType":      "pos_profit",
-        "holdSide":      hold_side,
-        "triggerPrice":  tp,
-        "triggerType":   "mark_price",
+        "symbol":       symbol,
+        "productType":  PRODUCT_TYPE,
+        "marginCoin":   "USDT",
+        "planType":     "profit",        # "profit" = take-profit
+        "holdSide":     hold_side,
+        "triggerPrice": tp,
+        "triggerType":  "mark_price",
+        "executePrice": "0",
     })
 
 
