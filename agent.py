@@ -31,14 +31,14 @@ BASE_URL      = "https://api.bitget.com"
 PRODUCT_TYPE  = "USDT-FUTURES"
 CLAUDE_MODEL  = "claude-sonnet-4-20250514"
 CYCLE_SECONDS = 15 * 60
-TOP_PAIRS     = 5           # deep candle data for top N pairs by 24h volume
+TOP_PAIRS     = 3           # deep candle data for top N pairs by 24h volume
 MAX_SIZE_PCT  = 0.20        # hard cap: never risk more than 20% per trade
 
 DATA_DIR    = Path(os.environ.get("DATA_DIR", "/data"))
 MEMORY_FILE = DATA_DIR / "memory.json"
 LOG_FILE    = DATA_DIR / "agent_log.md"
 
-CANDLE_CONFIGS = [("15m", 50), ("1H", 50), ("6H", 30)]   # compact: 3 TFs only
+CANDLE_CONFIGS = [("1H", 20), ("4H", 15), ("1D", 10)]
 
 SIDE_TO_CLOSE = {"long": "sell", "short": "buy"}   # position side → closing order side
 SIDE_TO_HOLD  = {"buy": "long", "sell": "short"}
@@ -291,19 +291,19 @@ def fetch_orderbook(symbol: str) -> dict:
     })
     if not data:
         return {}
-    return {"bids": data.get("bids", [])[:20], "asks": data.get("asks", [])[:20]}
+    return {"bids": data.get("bids", [])[:10], "asks": data.get("asks", [])[:10]}
 
 
 def fetch_trade_ticks(symbol: str) -> list:
     data = bg_get("/api/v2/mix/market/fills", {
-        "symbol": symbol, "productType": PRODUCT_TYPE, "limit": "20",
+        "symbol": symbol, "productType": PRODUCT_TYPE, "limit": "10",
     })
     if not data or not isinstance(data, list):
         return []
     # Compact: [price, size] only — side encoded as negative size for sells
     return [
         [t.get("price"), ("-" if t.get("side") == "sell" else "") + str(t.get("size", ""))]
-        for t in data[:20]
+        for t in data[:10]
     ]
 
 
