@@ -385,7 +385,8 @@ def tp_sl(entry: float, side: str, atr_val: float, vol: str) -> tuple:
 
 
 # ── Main Cycle ─────────────────────────────────────────────────────────────────
-def run_cycle(pair: str, daily_loss: float) -> float:
+def run_cycle(pair: str, daily_loss: float, prev_balance: float, prev_pos_ids: set) -> tuple:
+    """Returns (daily_loss, balance, pos_ids) after the cycle."""
     log.info(f"── {pair} cycle ──────────────────────────────────────")
 
     # 1. Fetch market data
@@ -406,22 +407,20 @@ def run_cycle(pair: str, daily_loss: float) -> float:
     short_ok = gauss_dir == "FALLING" and gauss_count >= GAUSS_BARS and st == "BEAR" and mtf_count >= MTF_MIN_CONFIRM
     signal   = "LONG" if long_ok else ("SHORT" if short_ok else "NO SIGNAL")
 
-    # 3. Safety checks + daily loss tracking
-    balance      = fetch_balance()
-    positions    = fetch_positions(pair)
-    pos_sides    = {p["holdSide"] for p in positions}
-    atr_vals     = calc_atr(highs, lows, closes, ATR_PERIOD)
-    vol          = kmeans_volatility(atr_vals[-100:])
+    # 3. Safety checks + daily loss tracking (closed positions only)
+    balance   = fetch_balance()
+    positions = fetch_positions(pair)
+    pos_sides = {p["holdSide"] for p in positions}
+    pos_ids   = {p["posId"] for p in positions if "posId" in p}
+    atr_vals  = calc_atr(highs, lows, closes, ATR_PERIOD)
+    vol       = kmeans_volatility(atr_vals[-100:])
 
-    # Detect SL hits: positions that disappeared since last cycle are tracked via
-    # unrealised PnL sign on still-open ones; for closed positions we approximate
-    # loss as RISK_PCT * balance per SL event by checking the bill/fill history.
-    for p in positions:
-        upl = float(p.get("unrealizedPL", 0))
-        entry_px = float(p.get("openPriceAvg", price))
-        sl_threshold = entry_px * SL_PCT
-        if abs(upl) >= sl_threshold * float(p.get("total", 0)):
-            daily_loss += abs(upl)
+    # A position closed this cycle if it existed last cycle and is now gone.
+    # If balance also dropped, that drop is a realised loss.
+    closed_ids = prev_pos_ids - pos_ids
+    if closed_ids and prev_balance > 0 and balance < prev_balance:
+        daily_loss += prev_balance - balance
+        log.info(f"Closed position detected — realised loss: ${prev_balance - balance:.2f}")
 
     if balance < MIN_BALANCE:
         log.warning(f"Balance ${balance:.2f} < minimum ${MIN_BALANCE} — skipping.")
@@ -473,7 +472,7 @@ def run_cycle(pair: str, daily_loss: float) -> float:
   Positions:  {len(positions)}  ({", ".join(pos_sides) if pos_sides else "None"})
 ╚═════════════════════════════════════════════════════════════""", flush=True)
 
-    return daily_loss   # carries accumulated loss back to main loop
+    return daily_loss, balance, pos_ids
 
 
 # ── Entry Point ────────────────────────────────────────────────────────────────
@@ -484,6 +483,8 @@ def main():
     day        = datetime.now(timezone.utc).date()
     daily_loss = 0.0
     errors     = 0
+    # Per-pair inter-cycle state for closed-position loss detection
+    pair_state = {pair: {"balance": 0.0, "pos_ids": set()} for pair in PAIRS}
 
     while True:
         now_day = datetime.now(timezone.utc).date()
@@ -493,7 +494,10 @@ def main():
 
         try:
             for pair in PAIRS:
-                daily_loss = run_cycle(pair, daily_loss)
+                ps = pair_state[pair]
+                daily_loss, ps["balance"], ps["pos_ids"] = run_cycle(
+                    pair, daily_loss, ps["balance"], ps["pos_ids"]
+                )
             errors = 0
         except Exception as e:
             errors += 1
