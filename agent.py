@@ -968,7 +968,11 @@ def trading_loop():
 
             analytics = compute_analytics(memory.get("trades", []))
             decision  = ask_claude(market_data, account, positions, analytics, memory, cycle)
-            execute_action(decision, account, positions, memory)
+
+            try:
+                execute_action(decision, account, positions, memory)
+            except Exception as e:
+                log.warning(f"execute_action failed (cycle continues): {e}", exc_info=True)
 
             save_memory(memory)
             append_agent_log(cycle, decision, analytics)
