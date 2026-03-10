@@ -662,7 +662,7 @@ def set_leverage(symbol: str, leverage: int):
         log.warning(f"set_leverage {symbol} x{leverage} failed (may already be set): {e}")
 
 
-def place_order(symbol: str, side: str, trade_side: str, size: float, order_type: str = "market", price: float = None, hold_side: str = None) -> dict:
+def place_order(symbol: str, side: str, trade_side: str, size: float, order_type: str = "market", price: float = None) -> dict:
     body = {
         "symbol":      symbol,
         "productType": PRODUCT_TYPE,
@@ -670,9 +670,9 @@ def place_order(symbol: str, side: str, trade_side: str, size: float, order_type
         "marginCoin":  "USDT",
         "size":        str(size),
         "side":        side,          # "buy" | "sell"
+        "tradeSide":   trade_side,    # "open" | "close"
         "orderType":   order_type,
     }
-    body["tradeSide"] = trade_side  # "open" or "close"
     if order_type == "limit" and price:
         body["price"] = str(price)
     return bg_post("/api/v2/mix/order/place-order", body) or {}
@@ -762,31 +762,21 @@ def execute_open(action: dict, account: dict, memory: dict) -> bool:
 
 def execute_close(action: dict, positions: list, memory: dict) -> bool:
     symbol    = action.get("close_symbol") or action.get("symbol", "")
+    side      = action.get("close_side") or action.get("side", "")
     close_pct = float(action.get("close_pct", 1.0))
 
-    # Find the actual position on Bitget — do NOT rely on decision.side
-    # Match by symbol only if one position exists, or use close_side as a hint
-    hint_side = action.get("close_side") or action.get("side", "")
-    if hint_side:
-        pos = next((p for p in positions if p["symbol"] == symbol and p["side"] == hint_side), None)
-    else:
-        # Fall back: first position for this symbol
-        pos = next((p for p in positions if p["symbol"] == symbol), None)
-
+    pos = next((p for p in positions if p["symbol"] == symbol and p["side"] == side), None)
     if not pos:
-        log.warning(f"execute_close: no live position for {symbol} (hint_side={hint_side!r}). Live: {[(p['symbol'], p['side']) for p in positions]}")
+        log.warning(f"No open position found for {symbol} {side}")
         return False
 
-    hold_side  = pos["side"]          # "long" or "short" — from Bitget API
-    api_side   = SIDE_TO_CLOSE[hold_side]  # "sell" or "buy"
     close_size = round(sf(pos["available_size"]) * close_pct, 4)
-
-    log.info(f"Closing {close_pct*100:.0f}% of {hold_side.upper()} {symbol}: side={api_side} holdSide={hold_side} size={close_size}")
-    log.info(f"Close order params: symbol={symbol!r} side={api_side!r} tradeSide='close' size={close_size} holdSide={hold_side!r}")
-    place_order(symbol, api_side, "close", close_size, hold_side=hold_side)
+    api_side   = SIDE_TO_CLOSE[side]
+    place_order(symbol, api_side, "close", close_size)
+    log.info(f"CLOSED {close_pct*100:.0f}% of {side.upper()} {symbol} size={close_size}")
 
     if close_pct >= 0.99:
-        key = f"{symbol}_{hold_side}"
+        key = f"{symbol}_{side}"
         record_closed_trade(memory, key, sf(pos.get("mark_price")), reason=action.get("reasoning", "manual close"))
 
     return True
