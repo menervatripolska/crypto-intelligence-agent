@@ -673,8 +673,8 @@ def place_order(symbol: str, side: str, trade_side: str, size: float, order_type
         "orderType":   order_type,
     }
     if hold_side:
-        # Closing with holdSide: omit tradeSide entirely (Bitget 22002 if both present)
-        body["holdSide"] = hold_side
+        # One-way position mode: use reduceOnly, no holdSide or tradeSide
+        body["reduceOnly"] = True
     else:
         body["tradeSide"] = trade_side  # "open" | "close" — only for opening orders
     if order_type == "limit" and price:
