@@ -652,11 +652,13 @@ def place_order(symbol: str, side: str, trade_side: str, size: float, order_type
         "marginCoin":  "USDT",
         "size":        str(size),
         "side":        side,          # "buy" | "sell"
-        "tradeSide":   trade_side,    # "open" | "close"
         "orderType":   order_type,
     }
     if hold_side:
-        body["holdSide"] = hold_side  # required by Bitget when closing a position
+        # Closing with holdSide: omit tradeSide entirely (Bitget 22002 if both present)
+        body["holdSide"] = hold_side
+    else:
+        body["tradeSide"] = trade_side  # "open" | "close" — only for opening orders
     if order_type == "limit" and price:
         body["price"] = str(price)
     return bg_post("/api/v2/mix/order/place-order", body) or {}
