@@ -672,11 +672,7 @@ def place_order(symbol: str, side: str, trade_side: str, size: float, order_type
         "side":        side,          # "buy" | "sell"
         "orderType":   order_type,
     }
-    if hold_side:
-        # One-way position mode: use reduceOnly, no holdSide or tradeSide
-        body["reduceOnly"] = True
-    else:
-        body["tradeSide"] = trade_side  # "open" | "close" — only for opening orders
+    body["tradeSide"] = trade_side  # "open" or "close"
     if order_type == "limit" and price:
         body["price"] = str(price)
     return bg_post("/api/v2/mix/order/place-order", body) or {}
