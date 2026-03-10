@@ -100,9 +100,12 @@ def api_get(path: str, params: dict = None) -> dict:
 def api_post(path: str, body: dict) -> dict:
     raw = json.dumps(body)
     r = requests.post(BASE_URL + path, headers=_headers("POST", path, raw), data=raw, timeout=10)
-    r.raise_for_status()
+    if not r.ok:
+        log.error(f"HTTP {r.status_code} from Bitget | path={path} | body={raw} | response={r.text}")
+        r.raise_for_status()
     data = r.json()
     if data.get("code") not in ("00000", 0, "0"):
+        log.error(f"Bitget API error | path={path} | body={raw} | response={r.text}")
         raise RuntimeError(f"Bitget API error: {data.get('msg')} (code={data.get('code')})")
     return data
 
@@ -446,7 +449,8 @@ def run_cycle(pair: str, daily_loss: float, prev_balance: float, prev_pos_ids: s
         signal = "NO SIGNAL"
 
     # 3b. Scan all open positions — apply TP/SL if missing
-    tpsl_actions = []
+    tpsl_actions  = []   # successes
+    tpsl_failures = []   # failures
     if positions:
         covered_sides = {o["holdSide"] for o in fetch_tpsl_orders(pair)}
         for p in positions:
@@ -457,10 +461,13 @@ def run_cycle(pair: str, daily_loss: float, prev_balance: float, prev_pos_ids: s
                     order_side = "buy" if h_side == "long" else "sell"
                     tp1, tp2, tp3, sl = calc_tp_sl(entry_px, order_side, atr_val)
                     place_tpsl(pair, h_side, tp=tp3, sl=sl)
-                    tpsl_actions.append(f"SET TP/SL on existing {h_side.upper()} (entry={entry_px:.2f} TP={tp3} SL={sl})")
-                    log.info(tpsl_actions[-1])
+                    msg = f"SET TP/SL on {h_side.upper()} entry={entry_px:.2f} TP={tp3} SL={sl}"
+                    tpsl_actions.append(msg)
+                    log.info(msg)
                 except Exception as e:
-                    log.error(f"Failed to set TP/SL on {h_side}: {e}")
+                    msg = f"TPSL FAILED on {h_side.upper()}: {e}"
+                    tpsl_failures.append(msg)
+                    log.error(msg)
 
     # Block new entry only if same pair + same side already open (or max positions hit)
     if signal == "LONG"  and "long"  in pos_sides:
@@ -507,7 +514,7 @@ def run_cycle(pair: str, daily_loss: float, prev_balance: float, prev_pos_ids: s
   Volatility: {vol} cluster
   Signal:     {signal}
   Action:     {action}
-  TP/SL scan: {"; ".join(tpsl_actions) if tpsl_actions else "all covered"}
+  TP/SL scan: {"; ".join(tpsl_actions + tpsl_failures) if (tpsl_actions or tpsl_failures) else "all covered"}
   Balance:    ${balance:.2f} USDT
   Positions:  {len(positions)}  ({", ".join(pos_sides) if pos_sides else "None"})
 ╚═════════════════════════════════════════════════════════════""", flush=True)
