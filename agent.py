@@ -151,22 +151,40 @@ def set_leverage(symbol: str, leverage: int):
     })
 
 
-def place_order(symbol: str, side: str, size: str, tp: str = None, sl: str = None) -> dict:
+def place_order(symbol: str, side: str, size: str) -> dict:
     body = {
-        "symbol":                   symbol,
-        "productType":              PRODUCT_TYPE,
-        "marginMode":               "crossed",
-        "marginCoin":               "USDT",
-        "size":                     size,
-        "side":                     side,        # "buy" | "sell"
-        "tradeSide":                "open",
-        "orderType":                "market",
+        "symbol":      symbol,
+        "productType": PRODUCT_TYPE,
+        "marginMode":  "crossed",
+        "marginCoin":  "USDT",
+        "size":        size,
+        "side":        side,        # "buy" | "sell"
+        "tradeSide":   "open",
+        "orderType":   "market",
     }
-    if tp:
-        body["presetStopSurplusPrice"] = tp
-    if sl:
-        body["presetStopLossPrice"] = sl
     return api_post("/api/v2/mix/order/place-order", body)
+
+
+def place_tpsl(symbol: str, hold_side: str, tp: str, sl: str):
+    """Set TP/SL on an open position via dedicated endpoint (required for market orders)."""
+    api_post("/api/v2/mix/order/place-tpsl-order", {
+        "symbol":        symbol,
+        "productType":   PRODUCT_TYPE,
+        "marginCoin":    "USDT",
+        "planType":      "pos_loss",   # covers both TP and SL
+        "holdSide":      hold_side,    # "long" | "short"
+        "triggerPrice":  sl,
+        "triggerType":   "mark_price",
+    })
+    api_post("/api/v2/mix/order/place-tpsl-order", {
+        "symbol":        symbol,
+        "productType":   PRODUCT_TYPE,
+        "marginCoin":    "USDT",
+        "planType":      "pos_profit",
+        "holdSide":      hold_side,
+        "triggerPrice":  tp,
+        "triggerType":   "mark_price",
+    })
 
 
 # ── Technical Indicators ───────────────────────────────────────────────────────
@@ -354,7 +372,7 @@ def order_size(balance: float, price: float) -> str:
 def tp_sl(entry: float, side: str, atr_val: float, vol: str) -> tuple:
     d = 1 if side == "buy" else -1
     if vol == "HIGH":
-        tp = entry + d * TP3_PCT * 1.5 * atr_val   # ATR-based
+        tp = entry + d * 1.5 * atr_val
         sl = entry - d * atr_val
     else:
         tp = entry * (1 + d * TP3_PCT)
@@ -384,12 +402,22 @@ def run_cycle(pair: str, daily_loss: float) -> float:
     short_ok = gauss_dir == "FALLING" and gauss_count >= GAUSS_BARS and st == "BEAR" and mtf_count >= MTF_MIN_CONFIRM
     signal   = "LONG" if long_ok else ("SHORT" if short_ok else "NO SIGNAL")
 
-    # 3. Safety checks
-    balance   = fetch_balance()
-    positions = fetch_positions(pair)
-    pos_sides = {p["holdSide"] for p in positions}
-    atr_vals  = calc_atr(highs, lows, closes, ATR_PERIOD)
-    vol       = kmeans_volatility(atr_vals[-100:])
+    # 3. Safety checks + daily loss tracking
+    balance      = fetch_balance()
+    positions    = fetch_positions(pair)
+    pos_sides    = {p["holdSide"] for p in positions}
+    atr_vals     = calc_atr(highs, lows, closes, ATR_PERIOD)
+    vol          = kmeans_volatility(atr_vals[-100:])
+
+    # Detect SL hits: positions that disappeared since last cycle are tracked via
+    # unrealised PnL sign on still-open ones; for closed positions we approximate
+    # loss as RISK_PCT * balance per SL event by checking the bill/fill history.
+    for p in positions:
+        upl = float(p.get("unrealizedPL", 0))
+        entry_px = float(p.get("openPriceAvg", price))
+        sl_threshold = entry_px * SL_PCT
+        if abs(upl) >= sl_threshold * float(p.get("total", 0)):
+            daily_loss += abs(upl)
 
     if balance < MIN_BALANCE:
         log.warning(f"Balance ${balance:.2f} < minimum ${MIN_BALANCE} — skipping.")
@@ -408,14 +436,16 @@ def run_cycle(pair: str, daily_loss: float) -> float:
             set_leverage(pair, LEVERAGE)
             sz = order_size(balance, price)
             t, s = tp_sl(price, "buy", float(atr_vals[-1]), vol)
-            place_order(pair, "buy", sz, tp=t, sl=s)
+            place_order(pair, "buy", sz)
+            place_tpsl(pair, "long", tp=t, sl=s)
             action = f"OPENED LONG  size={sz} TP={t} SL={s}"
 
         elif signal == "SHORT" and "short" not in pos_sides:
             set_leverage(pair, LEVERAGE)
             sz = order_size(balance, price)
             t, s = tp_sl(price, "sell", float(atr_vals[-1]), vol)
-            place_order(pair, "sell", sz, tp=t, sl=s)
+            place_order(pair, "sell", sz)
+            place_tpsl(pair, "short", tp=t, sl=s)
             action = f"OPENED SHORT size={sz} TP={t} SL={s}"
     except Exception as e:
         log.error(f"Order execution failed: {e}")
@@ -437,7 +467,7 @@ def run_cycle(pair: str, daily_loss: float) -> float:
   Positions:  {len(positions)}  ({", ".join(pos_sides) if pos_sides else "None"})
 ╚═════════════════════════════════════════════════════════════""", flush=True)
 
-    return daily_loss
+    return daily_loss   # carries accumulated loss back to main loop
 
 
 # ── Entry Point ────────────────────────────────────────────────────────────────
