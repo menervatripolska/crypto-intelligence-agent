@@ -441,6 +441,7 @@ def run_cycle(pair: str, daily_loss: float) -> float:
             sz = order_size(balance, price)
             t, s = tp_sl(price, "buy", float(atr_vals[-1]), vol)
             place_order(pair, "buy", sz)
+            time.sleep(2)
             place_tpsl(pair, "long", tp=t, sl=s)
             action = f"OPENED LONG  size={sz} TP={t} SL={s}"
 
@@ -449,6 +450,7 @@ def run_cycle(pair: str, daily_loss: float) -> float:
             sz = order_size(balance, price)
             t, s = tp_sl(price, "sell", float(atr_vals[-1]), vol)
             place_order(pair, "sell", sz)
+            time.sleep(2)
             place_tpsl(pair, "short", tp=t, sl=s)
             action = f"OPENED SHORT size={sz} TP={t} SL={s}"
     except Exception as e:
