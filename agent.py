@@ -31,7 +31,7 @@ BASE_URL      = "https://api.bitget.com"
 PRODUCT_TYPE  = "USDT-FUTURES"
 CLAUDE_MODEL  = "claude-sonnet-4-20250514"
 CYCLE_SECONDS = 15 * 60
-TOP_PAIRS     = 30          # deep data for top N pairs by 24h volume
+TOP_PAIRS     = 5           # deep candle data for top N pairs by 24h volume
 MAX_SIZE_PCT  = 0.20        # hard cap: never risk more than 20% per trade
 
 DATA_DIR    = Path(os.environ.get("DATA_DIR", "/data"))
@@ -458,8 +458,8 @@ def collect_all_market_data(open_symbols: set) -> dict:
             }
 
     # Select symbols for deep data
-    top_symbols   = [t.get("symbol") for t in tickers_sorted[:TOP_PAIRS] if t.get("symbol")]
-    deep_symbols  = list(dict.fromkeys(list(open_symbols) + top_symbols))[:TOP_PAIRS + len(open_symbols)]
+    top_symbols  = [t.get("symbol") for t in tickers_sorted[:TOP_PAIRS] if t.get("symbol")]
+    deep_symbols = list(dict.fromkeys(list(open_symbols) + top_symbols))  # open positions first
 
     log.info(f"Collecting deep data for {len(deep_symbols)} symbols...")
     deep_data = {}
@@ -598,7 +598,7 @@ def ask_claude(market_data: dict, account: dict, positions: list, analytics: dic
 
     response = client.messages.create(
         model=CLAUDE_MODEL,
-        max_tokens=4096,
+        max_tokens=2000,
         system=SYSTEM_PROMPT,
         messages=[{"role": "user", "content": user_msg}],
     )
