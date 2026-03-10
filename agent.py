@@ -378,6 +378,15 @@ def fetch_positions() -> list:
     data = bg_get("/api/v2/mix/position/all-position", {
         "productType": PRODUCT_TYPE, "marginCoin": "USDT",
     })
+    # Raw debug — log every record returned by Bitget before any filtering
+    log.info(f"fetch_positions raw response type={type(data).__name__} count={len(data) if isinstance(data, list) else 'N/A'}")
+    if isinstance(data, list):
+        for i, p in enumerate(data):
+            log.info(
+                f"  raw[{i}] symbol={p.get('symbol')!r} holdSide={p.get('holdSide')!r} "
+                f"total={p.get('total')!r} available={p.get('available')!r} "
+                f"posId={p.get('posId')!r} marginCoin={p.get('marginCoin')!r}"
+            )
     if not data:
         return []
     result = []
@@ -396,6 +405,7 @@ def fetch_positions() -> list:
                 "liquidation_price": sf(p.get("liquidationPrice")),
                 "pos_id":            p.get("posId", ""),
             })
+    log.info(f"fetch_positions filtered result: {[(p['symbol'], p['side'], p['size']) for p in result]}")
     return result
 
 
@@ -756,6 +766,7 @@ def execute_close(action: dict, positions: list, memory: dict) -> bool:
     close_size = round(sf(pos["available_size"]) * close_pct, 4)
 
     log.info(f"Closing {close_pct*100:.0f}% of {hold_side.upper()} {symbol}: side={api_side} holdSide={hold_side} size={close_size}")
+    log.info(f"Close order params: symbol={symbol!r} side={api_side!r} tradeSide='close' size={close_size} holdSide={hold_side!r}")
     place_order(symbol, api_side, "close", close_size, hold_side=hold_side)
 
     if close_pct >= 0.99:
