@@ -36,9 +36,27 @@ CYCLE_SECONDS = 15 * 60
 TOP_PAIRS     = 3           # deep candle data for top N pairs by 24h volume
 MAX_SIZE_PCT  = 0.20        # hard cap: never risk more than 20% per trade
 
-DATA_DIR    = Path(os.environ.get("DATA_DIR", "/data"))
+def _resolve_data_dir() -> Path:
+    """Return a writable data directory, falling back to ./data/ if /data is unusable."""
+    candidates = [
+        Path(os.environ.get("DATA_DIR", "/data")),
+        Path("./data"),
+    ]
+    for d in candidates:
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+            test = d / ".write_test"
+            test.write_text("ok")
+            test.unlink()
+            return d
+        except Exception as e:
+            print(f"[startup] DATA_DIR candidate {d} not writable: {e}", flush=True)
+    raise RuntimeError("No writable data directory found")
+
+DATA_DIR    = _resolve_data_dir()
 MEMORY_FILE = DATA_DIR / "memory.json"
 LOG_FILE    = DATA_DIR / "agent_log.md"
+print(f"[startup] DATA_DIR resolved to: {DATA_DIR.resolve()} | LOG_FILE={LOG_FILE} | MEMORY_FILE={MEMORY_FILE}", flush=True)
 
 CANDLE_CONFIGS = [("1H", 20), ("4H", 15), ("1D", 10)]
 
@@ -805,7 +823,7 @@ def execute_action(action: dict, account: dict, positions: list, memory: dict):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def append_agent_log(cycle: int, action: dict, analytics: dict):
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    log.info(f"append_agent_log: writing to {LOG_FILE} (DATA_DIR={DATA_DIR})")
     ts  = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     entry = f"""
 ---
@@ -826,9 +844,12 @@ def append_agent_log(cycle: int, action: dict, analytics: dict):
     try:
         with open(LOG_FILE, "a", encoding="utf-8") as f:
             f.write(entry)
-        log.info(f"Agent log written: {LOG_FILE} ({LOG_FILE.stat().st_size} bytes)")
+        # Read back immediately to confirm the write landed on disk
+        size_after = LOG_FILE.stat().st_size
+        readback   = LOG_FILE.read_text(encoding="utf-8")[-80:].replace("\n", "\\n")
+        log.info(f"append_agent_log OK: {LOG_FILE} size={size_after} bytes | tail={readback!r}")
     except Exception as e:
-        log.error(f"Failed to write agent log to {LOG_FILE}: {e}")
+        log.error(f"append_agent_log FAILED: {LOG_FILE}: {e}", exc_info=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
