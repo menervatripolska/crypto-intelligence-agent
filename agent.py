@@ -799,8 +799,12 @@ def append_agent_log(cycle: int, action: dict, analytics: dict):
 {action.get('self_reflection', '')}
 
 """
-    with open(LOG_FILE, "a", encoding="utf-8") as f:
-        f.write(entry)
+    try:
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(entry)
+        log.info(f"Agent log written: {LOG_FILE} ({LOG_FILE.stat().st_size} bytes)")
+    except Exception as e:
+        log.error(f"Failed to write agent log to {LOG_FILE}: {e}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -878,8 +882,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
 def _read_file(path: Path) -> str:
     if path.exists():
+        size = path.stat().st_size
+        log.info(f"Serving {path} ({size} bytes)")
         return path.read_text(encoding="utf-8")
-    return f"{path.name} not found — agent hasn't written it yet."
+    log.warning(f"File not found for serving: {path}")
+    return f"{path.name} not found — agent hasn't written it yet.\nExpected path: {path}"
 
 
 def _index_html() -> str:
