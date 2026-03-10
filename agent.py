@@ -51,8 +51,12 @@ LEVERAGE        = 10
 MIN_BALANCE     = 50.0
 MAX_POSITIONS   = 2
 DAILY_LOSS_PCT  = 0.05
-TP1_PCT = 0.010; TP2_PCT = 0.010; TP3_PCT = 0.015
-SL_PCT  = 0.010
+# ATR multipliers (all levels ATR-based)
+SL_ATR  = 2.0
+TP1_ATR = 2.0;  TP1_CLOSE = 0.30
+TP2_ATR = 3.5;  TP2_CLOSE = 0.30
+TP3_ATR = 5.0;  TP3_CLOSE = 0.40
+SL_PCT  = 0.010   # kept for daily_loss threshold approximation only
 
 # ── Logging ────────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -373,15 +377,27 @@ def order_size(balance: float, price: float) -> str:
     return f"{contracts:.4f}"
 
 
-def tp_sl(entry: float, side: str, atr_val: float, vol: str) -> tuple:
+def calc_tp_sl(entry: float, side: str, atr_val: float) -> tuple:
+    """Returns (tp1, tp2, tp3, sl) as formatted strings using ATR multiples."""
     d = 1 if side == "buy" else -1
-    if vol == "HIGH":
-        tp = entry + d * 1.5 * atr_val
-        sl = entry - d * atr_val
-    else:
-        tp = entry * (1 + d * TP3_PCT)
-        sl = entry * (1 - d * SL_PCT)
-    return f"{tp:.2f}", f"{sl:.2f}"
+    tp1 = entry + d * TP1_ATR * atr_val
+    tp2 = entry + d * TP2_ATR * atr_val
+    tp3 = entry + d * TP3_ATR * atr_val
+    sl  = entry - d * SL_ATR  * atr_val
+    return f"{tp1:.2f}", f"{tp2:.2f}", f"{tp3:.2f}", f"{sl:.2f}"
+
+
+def fetch_tpsl_orders(symbol: str) -> list:
+    """Returns list of active TP/SL plan orders for the symbol."""
+    try:
+        data = api_get("/api/v2/mix/order/tpsl-order", {
+            "symbol":      symbol,
+            "productType": PRODUCT_TYPE,
+            "isPlan":      "profit_loss",
+        })
+        return data.get("data", {}).get("entrustedList", [])
+    except Exception:
+        return []
 
 
 # ── Main Cycle ─────────────────────────────────────────────────────────────────
@@ -414,9 +430,9 @@ def run_cycle(pair: str, daily_loss: float, prev_balance: float, prev_pos_ids: s
     pos_ids   = {p["posId"] for p in positions if "posId" in p}
     atr_vals  = calc_atr(highs, lows, closes, ATR_PERIOD)
     vol       = kmeans_volatility(atr_vals[-100:])
+    atr_val   = float(atr_vals[-1])
 
-    # A position closed this cycle if it existed last cycle and is now gone.
-    # If balance also dropped, that drop is a realised loss.
+    # Detect realised losses from closed positions
     closed_ids = prev_pos_ids - pos_ids
     if closed_ids and prev_balance > 0 and balance < prev_balance:
         daily_loss += prev_balance - balance
@@ -428,30 +444,53 @@ def run_cycle(pair: str, daily_loss: float, prev_balance: float, prev_pos_ids: s
     if daily_loss >= DEPOSIT_REF * DAILY_LOSS_PCT:
         log.warning("Daily loss limit hit — skipping trades.")
         signal = "NO SIGNAL"
+
+    # 3b. Scan all open positions — apply TP/SL if missing
+    tpsl_actions = []
+    if positions:
+        covered_sides = {o["holdSide"] for o in fetch_tpsl_orders(pair)}
+        for p in positions:
+            h_side = p["holdSide"]   # "long" | "short"
+            if h_side not in covered_sides:
+                try:
+                    entry_px = float(p.get("openPriceAvg", price))
+                    order_side = "buy" if h_side == "long" else "sell"
+                    tp1, tp2, tp3, sl = calc_tp_sl(entry_px, order_side, atr_val)
+                    place_tpsl(pair, h_side, tp=tp3, sl=sl)
+                    tpsl_actions.append(f"SET TP/SL on existing {h_side.upper()} (entry={entry_px:.2f} TP={tp3} SL={sl})")
+                    log.info(tpsl_actions[-1])
+                except Exception as e:
+                    log.error(f"Failed to set TP/SL on {h_side}: {e}")
+
+    # Block new entry only if same pair + same side already open (or max positions hit)
+    if signal == "LONG"  and "long"  in pos_sides:
+        signal = "NO SIGNAL"   # duplicate long
+    if signal == "SHORT" and "short" in pos_sides:
+        signal = "NO SIGNAL"   # duplicate short
     if len(positions) >= MAX_POSITIONS:
         log.info("Max open positions reached — skipping new entry.")
         signal = "NO SIGNAL"
 
-    # 4. Execute
+    # 4. Execute new entry
     action = "Monitoring"
     try:
-        if signal == "LONG" and "long" not in pos_sides:
+        if signal == "LONG":
             set_leverage(pair, LEVERAGE)
             sz = order_size(balance, price)
-            t, s = tp_sl(price, "buy", float(atr_vals[-1]), vol)
+            tp1, tp2, tp3, sl = calc_tp_sl(price, "buy", atr_val)
             place_order(pair, "buy", sz)
             time.sleep(2)
-            place_tpsl(pair, "long", tp=t, sl=s)
-            action = f"OPENED LONG  size={sz} TP={t} SL={s}"
+            place_tpsl(pair, "long", tp=tp3, sl=sl)
+            action = f"OPENED LONG  size={sz} TP1={tp1} TP2={tp2} TP3={tp3} SL={sl}"
 
-        elif signal == "SHORT" and "short" not in pos_sides:
+        elif signal == "SHORT":
             set_leverage(pair, LEVERAGE)
             sz = order_size(balance, price)
-            t, s = tp_sl(price, "sell", float(atr_vals[-1]), vol)
+            tp1, tp2, tp3, sl = calc_tp_sl(price, "sell", atr_val)
             place_order(pair, "sell", sz)
             time.sleep(2)
-            place_tpsl(pair, "short", tp=t, sl=s)
-            action = f"OPENED SHORT size={sz} TP={t} SL={s}"
+            place_tpsl(pair, "short", tp=tp3, sl=sl)
+            action = f"OPENED SHORT size={sz} TP1={tp1} TP2={tp2} TP3={tp3} SL={sl}"
     except Exception as e:
         log.error(f"Order execution failed: {e}")
         action = f"ORDER FAILED: {e}"
@@ -468,6 +507,7 @@ def run_cycle(pair: str, daily_loss: float, prev_balance: float, prev_pos_ids: s
   Volatility: {vol} cluster
   Signal:     {signal}
   Action:     {action}
+  TP/SL scan: {"; ".join(tpsl_actions) if tpsl_actions else "all covered"}
   Balance:    ${balance:.2f} USDT
   Positions:  {len(positions)}  ({", ".join(pos_sides) if pos_sides else "None"})
 ╚═════════════════════════════════════════════════════════════""", flush=True)
