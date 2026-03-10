@@ -1,62 +1,47 @@
 #!/usr/bin/env python3
 """
-Crypto Intelligence — Gauss Trading Agent
-Runs the Gauss Trend System on Bitget every 15 minutes.
+Crypto Intelligence — Claude-Brain Trading Agent
+Claude AI is the brain. Python collects data, executes orders, manages memory.
 """
 
-import os
-import time
-import hmac
-import hashlib
 import base64
+import hashlib
+import hmac
 import json
-import math
 import logging
+import os
+import re
+import time
 from datetime import datetime, timezone
+from pathlib import Path
 
+import anthropic
 import requests
-import numpy as np
-from sklearn.cluster import KMeans
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# ── Configuration ──────────────────────────────────────────────────────────────
-API_KEY        = os.environ["BITGET_API_KEY"]
-SECRET_KEY     = os.environ["BITGET_SECRET_KEY"]
-PASSPHRASE     = os.environ["BITGET_PASSPHRASE"]
-BASE_URL       = "https://api.bitget.com"
-PRODUCT_TYPE   = "USDT-FUTURES"
+# ── Config ─────────────────────────────────────────────────────────────────────
+BITGET_API_KEY    = os.environ["BITGET_API_KEY"]
+BITGET_SECRET_KEY = os.environ["BITGET_SECRET_KEY"]
+BITGET_PASSPHRASE = os.environ["BITGET_PASSPHRASE"]
+ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 
-PAIRS           = ["BTCUSDT"]           # start with BTC only per strategy rules
-CANDLE_TF       = "1H"
-CANDLE_LIMIT    = 150                   # extra warmup bars
-CYCLE_SECONDS   = 15 * 60              # 15-minute loop
+BASE_URL      = "https://api.bitget.com"
+PRODUCT_TYPE  = "USDT-FUTURES"
+CLAUDE_MODEL  = "claude-sonnet-4-20250514"
+CYCLE_SECONDS = 15 * 60
+TOP_PAIRS     = 20          # deep data for top N pairs by 24h volume
+MAX_SIZE_PCT  = 0.20        # hard cap: never risk more than 20% per trade
 
-# Strategy params
-GAUSS_LEN       = 100
-GAUSS_SIGMA     = 30
-GAUSS_BARS      = 4                     # consecutive bars GWMA must trend
-ATR_PERIOD      = 14
-RSI_PERIOD      = 14
-ADX_PERIOD      = 14
-MTF_TIMEFRAMES  = ["1m", "3m", "5m", "15m", "1H", "2H", "3H", "4H", "12H", "1D"]
-MTF_EMA_LEN     = 10
-MTF_MIN_CONFIRM = 3
+DATA_DIR    = Path(os.environ.get("DATA_DIR", "/data"))
+MEMORY_FILE = DATA_DIR / "memory.json"
+LOG_FILE    = DATA_DIR / "agent_log.md"
 
-# Risk management
-DEPOSIT_REF     = 133.0
-RISK_PCT        = 0.10
-LEVERAGE        = 10
-MIN_BALANCE     = 50.0
-MAX_POSITIONS   = 2
-DAILY_LOSS_PCT  = 0.05
-# ATR multipliers (all levels ATR-based)
-SL_ATR  = 2.0
-TP1_ATR = 2.0;  TP1_CLOSE = 0.30
-TP2_ATR = 3.5;  TP2_CLOSE = 0.30
-TP3_ATR = 5.0;  TP3_CLOSE = 0.40
-SL_PCT  = 0.010   # kept for daily_loss threshold approximation only
+CANDLE_CONFIGS = [("15m", 100), ("1H", 100), ("6H", 50), ("12H", 50), ("1D", 30)]
+
+SIDE_TO_CLOSE = {"long": "sell", "short": "buy"}   # position side → closing order side
+SIDE_TO_HOLD  = {"buy": "long", "sell": "short"}
 
 # ── Logging ────────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -64,497 +49,830 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
-log = logging.getLogger("gauss-agent")
+log = logging.getLogger("claude-agent")
 
 
-# ── Bitget REST Client ─────────────────────────────────────────────────────────
-def _sign(timestamp: str, method: str, path: str, body: str = "") -> str:
-    msg = timestamp + method.upper() + path + body
-    mac = hmac.new(SECRET_KEY.encode(), msg.encode(), hashlib.sha256)
-    return base64.b64encode(mac.digest()).decode()
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION A — Bitget REST client
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _sign(ts: str, method: str, path: str, body: str = "") -> str:
+    msg = ts + method.upper() + path + body
+    return base64.b64encode(
+        hmac.new(BITGET_SECRET_KEY.encode(), msg.encode(), hashlib.sha256).digest()
+    ).decode()
 
 
 def _headers(method: str, path: str, body: str = "") -> dict:
     ts = str(int(time.time() * 1000))
     return {
-        "ACCESS-KEY":        API_KEY,
+        "ACCESS-KEY":        BITGET_API_KEY,
         "ACCESS-SIGN":       _sign(ts, method, path, body),
         "ACCESS-TIMESTAMP":  ts,
-        "ACCESS-PASSPHRASE": PASSPHRASE,
+        "ACCESS-PASSPHRASE": BITGET_PASSPHRASE,
         "Content-Type":      "application/json",
         "locale":            "en-US",
     }
 
 
-def api_get(path: str, params: dict = None) -> dict:
-    qs = ("?" + "&".join(f"{k}={v}" for k, v in params.items())) if params else ""
+def bg_get(path: str, params: dict = None) -> any:
+    qs   = ("?" + "&".join(f"{k}={v}" for k, v in params.items())) if params else ""
     full = path + qs
-    r = requests.get(BASE_URL + full, headers=_headers("GET", full), timeout=10)
-    r.raise_for_status()
-    data = r.json()
-    if data.get("code") not in ("00000", 0, "0"):
-        raise RuntimeError(f"Bitget API error: {data.get('msg')} (code={data.get('code')})")
-    return data
+    try:
+        r = requests.get(BASE_URL + full, headers=_headers("GET", full), timeout=15)
+        if not r.ok:
+            log.error(f"GET {path} HTTP {r.status_code}: {r.text[:300]}")
+            return None
+        d = r.json()
+        if d.get("code") not in ("00000", 0, "0"):
+            log.error(f"GET {path} API error {d.get('code')}: {d.get('msg')}")
+            return None
+        return d.get("data")
+    except Exception as e:
+        log.error(f"GET {path} exception: {e}")
+        return None
 
 
-def api_post(path: str, body: dict) -> dict:
+def bg_post(path: str, body: dict) -> any:
     raw = json.dumps(body)
-    r = requests.post(BASE_URL + path, headers=_headers("POST", path, raw), data=raw, timeout=10)
-    if not r.ok:
-        log.error(f"HTTP {r.status_code} from Bitget | path={path} | body={raw} | response={r.text}")
-        r.raise_for_status()
-    data = r.json()
-    if data.get("code") not in ("00000", 0, "0"):
-        log.error(f"Bitget API error | path={path} | body={raw} | response={r.text}")
-        raise RuntimeError(f"Bitget API error: {data.get('msg')} (code={data.get('code')})")
-    return data
+    try:
+        r = requests.post(BASE_URL + path, headers=_headers("POST", path, raw), data=raw, timeout=15)
+        if not r.ok:
+            log.error(f"POST {path} HTTP {r.status_code} | body={raw} | resp={r.text[:500]}")
+            r.raise_for_status()
+        d = r.json()
+        if d.get("code") not in ("00000", 0, "0"):
+            log.error(f"POST {path} API error {d.get('code')}: {d.get('msg')} | body={raw} | resp={r.text[:300]}")
+            raise RuntimeError(f"Bitget error {d.get('code')}: {d.get('msg')}")
+        return d.get("data")
+    except RuntimeError:
+        raise
+    except Exception as e:
+        log.error(f"POST {path} exception: {e}")
+        raise
 
 
-# ── Data Fetching ──────────────────────────────────────────────────────────────
-def fetch_candles(symbol: str, granularity: str, limit: int = 150) -> dict:
-    """Returns OHLCV arrays ordered oldest → newest."""
-    data = api_get("/api/v2/mix/market/candles", {
-        "symbol":      symbol,
-        "productType": PRODUCT_TYPE,
-        "granularity": granularity,
-        "limit":       limit,
-    })
-    rows = list(reversed(data.get("data", [])))   # API returns newest-first
+def sf(val, default=0.0) -> float:
+    """Safe float conversion."""
+    try:
+        return float(val) if val is not None else default
+    except (ValueError, TypeError):
+        return default
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION B — Memory management
+# ══════════════════════════════════════════════════════════════════════════════
+
+def load_memory() -> dict:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    if MEMORY_FILE.exists():
+        try:
+            return json.loads(MEMORY_FILE.read_text(encoding="utf-8"))
+        except Exception as e:
+            log.error(f"Memory load failed: {e} — starting fresh")
+    return {"trades": [], "open_trades": {}, "analytics": {}}
+
+
+def save_memory(memory: dict):
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = MEMORY_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(memory, indent=2, default=str), encoding="utf-8")
+    tmp.rename(MEMORY_FILE)
+
+
+def record_open_trade(memory: dict, key: str, info: dict):
+    """Track a newly opened position in memory."""
+    memory.setdefault("open_trades", {})[key] = info
+
+
+def record_closed_trade(memory: dict, key: str, exit_price: float, reason: str = ""):
+    """Move an open trade to the closed trades list and compute PnL."""
+    open_trades = memory.setdefault("open_trades", {})
+    trade = open_trades.pop(key, None)
+    if not trade:
+        log.warning(f"record_closed_trade: key '{key}' not found in open_trades")
+        return
+
+    entry  = sf(trade.get("entry_price"))
+    size   = sf(trade.get("size"))
+    lev    = sf(trade.get("leverage"), 1)
+    side   = trade.get("side", "long")
+    opened = trade.get("opened_at", "")
+
+    d = 1 if side == "long" else -1
+    pnl_pct  = d * (exit_price - entry) / entry * 100 if entry else 0
+    pnl_usdt = size * entry / lev * pnl_pct / 100 if entry and lev else 0
+
+    try:
+        opened_dt  = datetime.fromisoformat(opened.replace("Z", "+00:00"))
+        holding_h  = (datetime.now(timezone.utc) - opened_dt).total_seconds() / 3600
+    except Exception:
+        holding_h = 0
+
+    closed = {
+        "symbol":        trade.get("symbol"),
+        "side":          side,
+        "entry_price":   entry,
+        "exit_price":    exit_price,
+        "size":          size,
+        "leverage":      lev,
+        "pnl_usdt":      round(pnl_usdt, 4),
+        "pnl_pct":       round(pnl_pct, 2),
+        "holding_hours": round(holding_h, 2),
+        "opened_at":     opened,
+        "closed_at":     datetime.now(timezone.utc).isoformat(),
+        "outcome":       "win" if pnl_usdt > 0 else "loss",
+        "close_reason":  reason,
+        "reasoning":     trade.get("reasoning", ""),
+    }
+    memory.setdefault("trades", []).append(closed)
+    memory["analytics"] = compute_analytics(memory["trades"])
+    log.info(f"Trade closed: {closed['symbol']} {side} PnL={pnl_usdt:+.2f} USDT ({pnl_pct:+.2f}%)")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION C — Analytics
+# ══════════════════════════════════════════════════════════════════════════════
+
+def compute_analytics(trades: list) -> dict:
+    if not trades:
+        return {"total_trades": 0, "winrate_pct": 0, "total_pnl_usdt": 0}
+
+    wins   = [t for t in trades if sf(t.get("pnl_usdt")) > 0]
+    losses = [t for t in trades if sf(t.get("pnl_usdt")) <= 0]
+    total_pnl = sum(sf(t.get("pnl_usdt")) for t in trades)
+
+    # By asset
+    by_asset: dict = {}
+    for t in trades:
+        sym = t.get("symbol", "?")
+        ba  = by_asset.setdefault(sym, {"trades": 0, "wins": 0, "pnl": 0.0})
+        ba["trades"] += 1
+        ba["pnl"]    += sf(t.get("pnl_usdt"))
+        if sf(t.get("pnl_usdt")) > 0:
+            ba["wins"] += 1
+    for sym, ba in by_asset.items():
+        ba["winrate_pct"] = round(ba["wins"] / ba["trades"] * 100, 1)
+
+    # By hour of day (UTC)
+    by_hour: dict = {}
+    for t in trades:
+        try:
+            h = datetime.fromisoformat(t["opened_at"].replace("Z", "+00:00")).hour
+        except Exception:
+            h = -1
+        bh = by_hour.setdefault(h, {"trades": 0, "wins": 0, "pnl": 0.0})
+        bh["trades"] += 1
+        bh["pnl"]    += sf(t.get("pnl_usdt"))
+        if sf(t.get("pnl_usdt")) > 0:
+            bh["wins"] += 1
+
+    # Consecutive streaks (most recent first)
+    cur_streak = cur_type = 0
+    for t in reversed(trades):
+        outcome = "win" if sf(t.get("pnl_usdt")) > 0 else "loss"
+        if cur_streak == 0:
+            cur_type = outcome
+            cur_streak = 1
+        elif outcome == cur_type:
+            cur_streak += 1
+        else:
+            break
+
+    # Average holding time
+    holding = [sf(t.get("holding_hours")) for t in trades if t.get("holding_hours")]
+    avg_holding = sum(holding) / len(holding) if holding else 0
+
+    sorted_by_pnl = sorted(trades, key=lambda t: sf(t.get("pnl_usdt")))
+
     return {
-        "open":   np.array([float(r[1]) for r in rows]),
-        "high":   np.array([float(r[2]) for r in rows]),
-        "low":    np.array([float(r[3]) for r in rows]),
-        "close":  np.array([float(r[4]) for r in rows]),
-        "volume": np.array([float(r[5]) for r in rows]),
+        "total_trades":    len(trades),
+        "wins":            len(wins),
+        "losses":          len(losses),
+        "winrate_pct":     round(len(wins) / len(trades) * 100, 1),
+        "total_pnl_usdt":  round(total_pnl, 4),
+        "avg_pnl_usdt":    round(total_pnl / len(trades), 4),
+        "avg_holding_hours": round(avg_holding, 2),
+        "by_asset":        by_asset,
+        "by_hour_utc":     by_hour,
+        "current_streak":  {"type": cur_type, "count": cur_streak},
+        "best_trades":     sorted_by_pnl[-5:],
+        "worst_trades":    sorted_by_pnl[:5],
+        "last_10_trades":  trades[-10:],
     }
 
 
-def fetch_balance() -> float:
-    """Available USDT in futures account."""
-    data = api_get("/api/v2/mix/account/accounts", {"productType": PRODUCT_TYPE})
-    for acc in data.get("data", []):
-        if acc.get("marginCoin") == "USDT":
-            return float(acc.get("available", 0))
-    return 0.0
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION D — Market data collection
+# ══════════════════════════════════════════════════════════════════════════════
+
+def fetch_all_tickers() -> list:
+    data = bg_get("/api/v2/mix/market/tickers", {"productType": PRODUCT_TYPE})
+    if not data:
+        return []
+    return data if isinstance(data, list) else data.get("tickers", [])
 
 
-def fetch_positions(symbol: str) -> list:
-    data = api_get("/api/v2/mix/position/all-position", {
-        "productType": PRODUCT_TYPE,
-        "marginCoin":  "USDT",
+def fetch_candles(symbol: str, granularity: str, limit: int) -> list:
+    rows = bg_get("/api/v2/mix/market/candles", {
+        "symbol": symbol, "productType": PRODUCT_TYPE,
+        "granularity": granularity, "limit": limit,
     })
-    return [
-        p for p in data.get("data", [])
-        if p.get("symbol") == symbol and float(p.get("total", 0)) > 0
-    ]
+    if not rows or not isinstance(rows, list):
+        return []
+    rows = list(reversed(rows))
+    return [{"t": r[0], "o": r[1], "h": r[2], "l": r[3], "c": r[4], "v": r[5]} for r in rows]
+
+
+def fetch_orderbook(symbol: str) -> dict:
+    data = bg_get("/api/v2/mix/market/depth", {
+        "symbol": symbol, "productType": PRODUCT_TYPE, "limit": "20",
+    })
+    if not data:
+        return {}
+    return {"bids": data.get("bids", [])[:20], "asks": data.get("asks", [])[:20]}
+
+
+def fetch_trade_ticks(symbol: str) -> list:
+    data = bg_get("/api/v2/mix/market/fills", {
+        "symbol": symbol, "productType": PRODUCT_TYPE, "limit": "100",
+    })
+    if not data or not isinstance(data, list):
+        return []
+    return [{"t": t.get("ts"), "p": t.get("price"), "s": t.get("size"), "side": t.get("side")} for t in data]
+
+
+def fetch_funding_rate(symbol: str) -> dict:
+    data = bg_get("/api/v2/mix/market/current-fund-rate", {
+        "symbol": symbol, "productType": PRODUCT_TYPE,
+    })
+    if not data:
+        return {}
+    item = data[0] if isinstance(data, list) and data else data
+    return {"funding_rate": item.get("fundingRate"), "next_funding_time": item.get("nextFundingTime")}
+
+
+def fetch_open_interest(symbol: str) -> dict:
+    data = bg_get("/api/v2/mix/market/open-interest", {
+        "symbol": symbol, "productType": PRODUCT_TYPE,
+    })
+    if not data:
+        return {}
+    item = data[0] if isinstance(data, list) and data else data
+    return {"open_interest": item.get("openInterest"), "open_interest_coin": item.get("openInterestCoin")}
+
+
+def fetch_ls_ratio(symbol: str) -> dict:
+    data = bg_get("/api/v2/mix/market/account-long-short-ratio", {
+        "symbol": symbol, "productType": PRODUCT_TYPE, "period": "1H",
+    })
+    if not data or not isinstance(data, list) or not data:
+        return {}
+    latest = data[-1]
+    return {"long_pct": latest.get("longAccountRatio"), "short_pct": latest.get("shortAccountRatio")}
+
+
+def fetch_elite_ratio(symbol: str) -> dict:
+    data = bg_get("/api/v2/mix/market/long-short-ratio", {
+        "symbol": symbol, "productType": PRODUCT_TYPE, "period": "1H",
+    })
+    if not data or not isinstance(data, list) or not data:
+        return {}
+    latest = data[-1]
+    return {"elite_long_pct": latest.get("longRatio"), "elite_short_pct": latest.get("shortRatio")}
+
+
+def fetch_mark_index(symbol: str) -> dict:
+    data = bg_get("/api/v2/mix/market/symbol-price", {
+        "symbol": symbol, "productType": PRODUCT_TYPE,
+    })
+    if not data:
+        return {}
+    item = data[0] if isinstance(data, list) and data else data
+    mark  = sf(item.get("markPrice"))
+    index = sf(item.get("indexPrice"))
+    spread_bps = round((mark - index) / index * 10000, 2) if index else None
+    return {"mark_price": mark, "index_price": index, "spread_bps": spread_bps}
+
+
+def fetch_balance() -> dict:
+    data = bg_get("/api/v2/mix/account/accounts", {"productType": PRODUCT_TYPE})
+    if not data:
+        return {"available": 0, "equity": 0, "unrealized_pnl": 0}
+    accounts = data if isinstance(data, list) else []
+    for acc in accounts:
+        if acc.get("marginCoin") == "USDT":
+            return {
+                "available":      sf(acc.get("available")),
+                "equity":         sf(acc.get("accountEquity", acc.get("usdtEquity"))),
+                "unrealized_pnl": sf(acc.get("unrealizedPL")),
+                "margin_ratio":   acc.get("marginRatio"),
+                "used_margin":    sf(acc.get("frozen")),
+            }
+    return {"available": 0, "equity": 0, "unrealized_pnl": 0}
+
+
+def fetch_positions() -> list:
+    data = bg_get("/api/v2/mix/position/all-position", {
+        "productType": PRODUCT_TYPE, "marginCoin": "USDT",
+    })
+    if not data:
+        return []
+    result = []
+    for p in (data if isinstance(data, list) else []):
+        if sf(p.get("total")) > 0:
+            result.append({
+                "symbol":            p.get("symbol"),
+                "side":              p.get("holdSide"),
+                "size":              sf(p.get("total")),
+                "available_size":    sf(p.get("available")),
+                "entry_price":       sf(p.get("openPriceAvg")),
+                "mark_price":        sf(p.get("markPrice")),
+                "unrealized_pnl":    sf(p.get("unrealizedPL")),
+                "leverage":          sf(p.get("leverage")),
+                "margin":            sf(p.get("margin")),
+                "liquidation_price": sf(p.get("liquidationPrice")),
+                "pos_id":            p.get("posId", ""),
+            })
+    return result
+
+
+def collect_deep_data(symbol: str) -> dict:
+    """All per-symbol deep data. Each fetch is isolated — failures stored as None."""
+    result = {}
+    for granularity, limit in CANDLE_CONFIGS:
+        key = f"candles_{granularity.lower()}"
+        try:
+            result[key] = fetch_candles(symbol, granularity, limit)
+        except Exception as e:
+            log.warning(f"{symbol} candles {granularity} failed: {e}")
+            result[key] = None
+        time.sleep(0.15)
+
+    for fname, fn in [
+        ("orderbook",    lambda: fetch_orderbook(symbol)),
+        ("trade_ticks",  lambda: fetch_trade_ticks(symbol)),
+        ("funding_rate", lambda: fetch_funding_rate(symbol)),
+        ("open_interest",lambda: fetch_open_interest(symbol)),
+        ("ls_ratio",     lambda: fetch_ls_ratio(symbol)),
+        ("elite_ratio",  lambda: fetch_elite_ratio(symbol)),
+        ("mark_index",   lambda: fetch_mark_index(symbol)),
+    ]:
+        try:
+            result[fname] = fn()
+        except Exception as e:
+            log.warning(f"{symbol} {fname} failed: {e}")
+            result[fname] = None
+        time.sleep(0.15)
+
+    return result
+
+
+def collect_all_market_data(open_symbols: set) -> dict:
+    """Top-level data collection: tickers for all pairs, deep data for top N + open positions."""
+    tickers = fetch_all_tickers()
+
+    # Build ticker summary for top 50 by volume
+    try:
+        tickers_sorted = sorted(
+            tickers,
+            key=lambda t: sf(t.get("quoteVolume", t.get("usdtVolume", t.get("baseVolume", 0)))),
+            reverse=True,
+        )
+    except Exception:
+        tickers_sorted = tickers
+
+    ticker_summary = {}
+    for t in tickers_sorted[:50]:
+        sym = t.get("symbol")
+        if sym:
+            ticker_summary[sym] = {
+                "last_price":    t.get("lastPr"),
+                "change_24h":    t.get("change24h"),
+                "volume_24h":    t.get("quoteVolume", t.get("usdtVolume")),
+                "high_24h":      t.get("high24h"),
+                "low_24h":       t.get("low24h"),
+                "open_24h":      t.get("open24h"),
+                "funding_rate":  t.get("fundingRate"),
+            }
+
+    # Select symbols for deep data
+    top_symbols   = [t.get("symbol") for t in tickers_sorted[:TOP_PAIRS] if t.get("symbol")]
+    deep_symbols  = list(dict.fromkeys(list(open_symbols) + top_symbols))[:TOP_PAIRS + len(open_symbols)]
+
+    log.info(f"Collecting deep data for {len(deep_symbols)} symbols...")
+    deep_data = {}
+    for sym in deep_symbols:
+        if sym:
+            deep_data[sym] = collect_deep_data(sym)
+
+    return {
+        "total_pairs":    len(tickers),
+        "ticker_summary": ticker_summary,
+        "deep_data":      deep_data,
+        "collected_at":   datetime.now(timezone.utc).isoformat(),
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION E — Claude brain
+# ══════════════════════════════════════════════════════════════════════════════
+
+SYSTEM_PROMPT = """You are a senior quantitative trader and risk manager with deep expertise in crypto derivatives, market microstructure, behavioral finance and probability theory. You have traded through every major crypto cycle. Your edge is probabilistic thinking and ruthless discipline.
+
+Your singular goal: grow this account through high-probability profitable trades.
+
+BEFORE EVERY DECISION think step by step:
+
+STEP 1 - MARKET STRUCTURE ANALYSIS:
+What is the current market regime? Trending, ranging, or transitioning?
+What does multi-timeframe analysis tell you?
+Where is the smart money positioned based on funding rates, open interest, elite ratios?
+What are the key levels - support, resistance, liquidity pools?
+
+STEP 2 - OPPORTUNITY SCAN:
+Scan all available pairs.
+Which pair has the clearest highest probability setup right now?
+Why this pair over all others?
+
+STEP 3 - SELF REFLECTION ON HISTORY:
+Review your complete trade history.
+What patterns produced profit? Are those conditions present now?
+What patterns produced loss? Are those conditions present now?
+Were your last decisions correct? If not - why?
+What would you do differently based on what you have learned?
+How should your current approach evolve based on accumulated results?
+
+STEP 4 - PROBABILITY ASSESSMENT:
+What is the probability of profit for the best current setup?
+What is the expected value of acting vs waiting?
+Is this probability clearly above 60%? If not - WAIT.
+
+STEP 5 - DECISION AND EXECUTION:
+Based on steps 1-4 make your decision:
+- Whether to trade or not: only if probability clearly favors profit.
+- Which asset: highest probability opportunity from full pair scan.
+- Direction long or short: which has higher probability given full analysis.
+- Leverage: maximizes expected profit while keeping liquidation probability near zero.
+- Position size: optimal for this setup probability and account balance.
+- Stop loss or not and where: does it increase expected profit?
+- Take profit or not and where: does it increase expected profit? How many levels?
+- Market or limit order: which gives better expected fill?
+- How many positions: does more increase total expected profit or dilute edge?
+- Close early: has market structure changed on open positions? Close now if better for total profit.
+- Add to position: does adding increase expected profit of total position?
+- Do nothing: is WAIT the highest expected value action?
+
+STEP 6 - SELF ORGANIZATION:
+After your decision reflect: What is your current edge in this market? Is your approach working or does it need to evolve? What will you watch for in the next cycle?
+
+Once you decide - ACT immediately. Do not second guess. You analyzed, you decided, now execute. A decision without action has zero expected value.
+
+Capital preservation IS profit maximization. Never trade just to trade. Patience is your edge when market is unclear.
+
+Return ONLY valid JSON. No markdown, no explanation outside JSON.
+Minimum required fields:
+{
+  "action": "OPEN|CLOSE|PARTIAL_CLOSE|ADD|WAIT",
+  "reasoning": "full step by step analysis",
+  "self_reflection": "what you learned and how approach evolves",
+  "confidence": 0.0-1.0
+}
+Add these fields only when relevant to your action:
+  "symbol": "e.g. BTCUSDT",
+  "side": "long or short",
+  "leverage": integer,
+  "size_pct": 0.0-1.0 fraction of available balance,
+  "order_type": "market or limit",
+  "limit_price": float,
+  "sl_price": float,
+  "tp_prices": [float, ...],
+  "tp_sizes": [0.0-1.0, ...] fractions summing to <=1.0,
+  "close_symbol": "symbol of position to close",
+  "close_side": "long or short",
+  "close_pct": 0.0-1.0"""
+
+
+def ask_claude(market_data: dict, account: dict, positions: list, analytics: dict, memory: dict, cycle: int) -> dict:
+    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+
+    payload = {
+        "cycle":           cycle,
+        "timestamp_utc":   datetime.now(timezone.utc).isoformat(),
+        "account":         account,
+        "open_positions":  positions,
+        "open_trades_memory": memory.get("open_trades", {}),
+        "analytics":       analytics,
+        "market":          market_data,
+    }
+
+    user_msg = json.dumps(payload, default=str)
+    log.info(f"Sending {len(user_msg):,} chars to Claude...")
+
+    response = client.messages.create(
+        model=CLAUDE_MODEL,
+        max_tokens=4096,
+        system=SYSTEM_PROMPT,
+        messages=[{"role": "user", "content": user_msg}],
+    )
+
+    raw = response.content[0].text.strip()
+    log.info(f"Claude responded ({len(raw)} chars)")
+
+    # Extract JSON — find outermost { }
+    match = re.search(r'\{[\s\S]*\}', raw)
+    if not match:
+        raise ValueError(f"No JSON in Claude response: {raw[:300]}")
+    return json.loads(match.group())
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION F — Trade execution
+# ══════════════════════════════════════════════════════════════════════════════
+
+def get_mark_price(symbol: str) -> float:
+    data = fetch_mark_index(symbol)
+    return data.get("mark_price", 0.0)
 
 
 def set_leverage(symbol: str, leverage: int):
-    api_post("/api/v2/mix/account/set-leverage", {
-        "symbol":      symbol,
-        "productType": PRODUCT_TYPE,
-        "marginCoin":  "USDT",
-        "leverage":    str(leverage),
-    })
+    try:
+        bg_post("/api/v2/mix/account/set-leverage", {
+            "symbol": symbol, "productType": PRODUCT_TYPE,
+            "marginCoin": "USDT", "leverage": str(leverage),
+        })
+    except Exception as e:
+        log.warning(f"set_leverage {symbol} x{leverage} failed (may already be set): {e}")
 
 
-def place_order(symbol: str, side: str, size: str) -> dict:
+def place_order(symbol: str, side: str, trade_side: str, size: float, order_type: str = "market", price: float = None) -> dict:
     body = {
         "symbol":      symbol,
         "productType": PRODUCT_TYPE,
         "marginMode":  "crossed",
         "marginCoin":  "USDT",
-        "size":        size,
-        "side":        side,        # "buy" | "sell"
-        "tradeSide":   "open",
-        "orderType":   "market",
+        "size":        str(size),
+        "side":        side,          # "buy" | "sell"
+        "tradeSide":   trade_side,    # "open" | "close"
+        "orderType":   order_type,
     }
-    return api_post("/api/v2/mix/order/place-order", body)
+    if order_type == "limit" and price:
+        body["price"] = str(price)
+    return bg_post("/api/v2/mix/order/place-order", body) or {}
 
 
-def place_tpsl(symbol: str, hold_side: str, tp: str, sl: str):
-    """Set TP and SL on an open position via dedicated endpoint (required for market orders)."""
-    # SL order
-    api_post("/api/v2/mix/order/place-tpsl-order", {
-        "symbol":       symbol,
-        "productType":  PRODUCT_TYPE,
-        "marginCoin":   "USDT",
-        "planType":     "loss",          # "loss" = stop-loss
-        "holdSide":     hold_side,       # "long" | "short"
-        "triggerPrice": sl,
-        "triggerType":  "mark_price",
-        "executePrice": "0",             # 0 = market execution
-    })
-    # TP order
-    api_post("/api/v2/mix/order/place-tpsl-order", {
-        "symbol":       symbol,
-        "productType":  PRODUCT_TYPE,
-        "marginCoin":   "USDT",
-        "planType":     "profit",        # "profit" = take-profit
-        "holdSide":     hold_side,
-        "triggerPrice": tp,
-        "triggerType":  "mark_price",
-        "executePrice": "0",
-    })
-
-
-# ── Technical Indicators ───────────────────────────────────────────────────────
-def gaussian_wma(closes: np.ndarray, length: int = 100, sigma: int = 30) -> np.ndarray:
-    """Gaussian weighted moving average, lag-0 centered on most recent bar."""
-    weights = np.array([math.exp(-0.5 * (i / sigma) ** 2) for i in range(length)])
-    weights /= weights.sum()
-    result = np.full(len(closes), np.nan)
-    for i in range(length - 1, len(closes)):
-        window = closes[i - length + 1: i + 1][::-1]   # newest first inside window
-        result[i] = np.dot(window, weights)
-    return result
-
-
-def ema(closes: np.ndarray, period: int) -> np.ndarray:
-    if len(closes) < period:
-        return np.full(len(closes), np.nan)
-    k = 2 / (period + 1)
-    result = np.full(len(closes), np.nan)
-    result[period - 1] = closes[:period].mean()
-    for i in range(period, len(closes)):
-        result[i] = closes[i] * k + result[i - 1] * (1 - k)
-    return result
-
-
-def calc_atr(highs: np.ndarray, lows: np.ndarray, closes: np.ndarray, period: int = 14) -> np.ndarray:
-    tr = np.maximum(
-        highs[1:] - lows[1:],
-        np.maximum(np.abs(highs[1:] - closes[:-1]), np.abs(lows[1:] - closes[:-1])),
-    )
-    tr = np.concatenate([[highs[0] - lows[0]], tr])
-    result = np.full(len(closes), np.nan)
-    result[period - 1] = tr[:period].mean()
-    for i in range(period, len(closes)):
-        result[i] = (result[i - 1] * (period - 1) + tr[i]) / period
-    return result
-
-
-def calc_rsi(closes: np.ndarray, period: int = 14) -> np.ndarray:
-    delta = np.diff(closes)
-    gains  = np.where(delta > 0, delta, 0.0)
-    losses = np.where(delta < 0, -delta, 0.0)
-    ag = np.full(len(closes), np.nan)
-    al = np.full(len(closes), np.nan)
-    ag[period] = gains[:period].mean()
-    al[period] = losses[:period].mean()
-    for i in range(period + 1, len(closes)):
-        ag[i] = (ag[i - 1] * (period - 1) + gains[i - 1]) / period
-        al[i] = (al[i - 1] * (period - 1) + losses[i - 1]) / period
-    rs = ag / np.where(al == 0, 1e-10, al)
-    out = 100 - 100 / (1 + rs)
-    out[:period] = np.nan
-    return out
-
-
-def gaussian_smooth(series: np.ndarray, sigma: int = 5) -> np.ndarray:
-    half = sigma * 3
-    kernel = np.array([math.exp(-0.5 * (i / sigma) ** 2) for i in range(-half, half + 1)])
-    kernel /= kernel.sum()
-    result = np.full(len(series), np.nan)
-    for i in range(half, len(series) - half):
-        chunk = series[i - half: i + half + 1]
-        if not np.any(np.isnan(chunk)):
-            result[i] = np.dot(chunk, kernel)
-    return result
-
-
-def calc_adx(highs: np.ndarray, lows: np.ndarray, closes: np.ndarray, period: int = 14) -> tuple:
-    """Returns (adx_array, smoothed_adx_array)."""
-    dm_p = np.where(
-        (highs[1:] - highs[:-1]) > (lows[:-1] - lows[1:]),
-        np.maximum(highs[1:] - highs[:-1], 0), 0,
-    )
-    dm_m = np.where(
-        (lows[:-1] - lows[1:]) > (highs[1:] - highs[:-1]),
-        np.maximum(lows[:-1] - lows[1:], 0), 0,
-    )
-    tr = np.maximum(
-        highs[1:] - lows[1:],
-        np.maximum(np.abs(highs[1:] - closes[:-1]), np.abs(lows[1:] - closes[:-1])),
-    )
-
-    def wilder_smooth(arr):
-        out = np.full(len(arr) + 1, np.nan)
-        out[period] = arr[:period].sum()
-        for i in range(period, len(arr)):
-            out[i + 1] = out[i] - out[i] / period + arr[i]
-        return out[1:]
-
-    str_  = wilder_smooth(tr)
-    sdm_p = wilder_smooth(dm_p)
-    sdm_m = wilder_smooth(dm_m)
-    di_p  = 100 * sdm_p / np.where(str_ == 0, 1e-10, str_)
-    di_m  = 100 * sdm_m / np.where(str_ == 0, 1e-10, str_)
-    dx    = 100 * np.abs(di_p - di_m) / np.where((di_p + di_m) == 0, 1e-10, di_p + di_m)
-
-    adx_arr = np.full(len(highs), np.nan)
-    start   = 2 * period - 1
-    if start < len(dx):
-        adx_arr[start] = dx[period - 1: 2 * period - 1].mean()
-        for i in range(start + 1, len(highs)):
-            adx_arr[i] = (adx_arr[i - 1] * (period - 1) + dx[i - 1]) / period
-
-    smooth_adx = ema(np.nan_to_num(adx_arr), period)
-    return adx_arr, smooth_adx
-
-
-def kmeans_volatility(atr_values: np.ndarray) -> str:
-    """Classify current ATR into HIGH / MEDIUM / LOW cluster."""
-    valid = atr_values[~np.isnan(atr_values)].reshape(-1, 1)
-    if len(valid) < 10:
-        return "MEDIUM"
-    km = KMeans(n_clusters=3, n_init=10, random_state=42).fit(valid)
-    centers = sorted(km.cluster_centers_.flatten())
-    current_label = km.predict([[valid[-1][0]]])[0]
-    center_val = km.cluster_centers_[current_label][0]
-    if abs(center_val - centers[2]) < 1e-9:
-        return "HIGH"
-    if abs(center_val - centers[0]) < 1e-9:
-        return "LOW"
-    return "MEDIUM"
-
-
-# ── Strategy Layers ────────────────────────────────────────────────────────────
-def layer1_gaussian(closes: np.ndarray) -> tuple:
-    """Returns (direction: str, consecutive_bars: int)."""
-    gwma = gaussian_wma(closes, GAUSS_LEN, GAUSS_SIGMA)
-    vals = gwma[~np.isnan(gwma)]
-    if len(vals) < 5:
-        return "FLAT", 0
-    direction = "RISING" if vals[-1] > vals[-2] else "FALLING"
-    count = 0
-    for i in range(len(vals) - 1, 0, -1):
-        if direction == "RISING"  and vals[i] > vals[i - 1]:
-            count += 1
-        elif direction == "FALLING" and vals[i] < vals[i - 1]:
-            count += 1
-        else:
-            break
-    return direction, count
-
-
-def layer2_smart_trend(highs: np.ndarray, lows: np.ndarray, closes: np.ndarray) -> str:
-    """Returns 'BULL', 'BEAR', or 'NEUTRAL'."""
-    atr_vals = calc_atr(highs, lows, closes, ATR_PERIOD)
-    rsi_vals = calc_rsi(closes, RSI_PERIOD)
-    g_rsi    = gaussian_smooth(rsi_vals, sigma=5)
-    adx_vals, smooth_adx = calc_adx(highs, lows, closes, ADX_PERIOD)
-
-    cur_rsi    = g_rsi[~np.isnan(g_rsi)][-1]    if not np.all(np.isnan(g_rsi))    else 50
-    cur_adx    = adx_vals[~np.isnan(adx_vals)][-1]  if not np.all(np.isnan(adx_vals))  else 0
-    cur_sadx   = smooth_adx[~np.isnan(smooth_adx)][-1] if not np.all(np.isnan(smooth_adx)) else 0
-
-    if cur_adx > cur_sadx and cur_adx > 15:
-        return "BULL" if cur_rsi > 50 else "BEAR"
-    return "NEUTRAL"
-
-
-def layer3_mtf(symbol: str, target: str) -> int:
-    """Returns number of timeframes confirming target direction."""
-    confirmed = 0
-    for tf in MTF_TIMEFRAMES:
+def place_tpsl(symbol: str, hold_side: str, sl_price: float = None, tp_price: float = None):
+    """Place SL and/or TP plan orders on an open position."""
+    if sl_price:
         try:
-            c = fetch_candles(symbol, tf, limit=MTF_EMA_LEN + 10)
-            e = ema(c["close"], MTF_EMA_LEN)
-            valid_e = e[~np.isnan(e)]
-            if len(valid_e) == 0:
-                continue
-            if target == "BULL" and c["close"][-1] > valid_e[-1]:
-                confirmed += 1
-            elif target == "BEAR" and c["close"][-1] < valid_e[-1]:
-                confirmed += 1
-        except Exception:
-            pass   # some TFs may be unavailable; skip silently
-    return confirmed
+            bg_post("/api/v2/mix/order/place-tpsl-order", {
+                "symbol": symbol, "productType": PRODUCT_TYPE,
+                "marginCoin": "USDT", "planType": "loss",
+                "holdSide": hold_side, "triggerPrice": str(sl_price),
+                "triggerType": "mark_price", "executePrice": "0",
+            })
+            log.info(f"SL set: {symbol} {hold_side} @ {sl_price}")
+        except Exception as e:
+            log.error(f"SL placement failed {symbol} {hold_side}: {e}")
+
+    if tp_price:
+        try:
+            bg_post("/api/v2/mix/order/place-tpsl-order", {
+                "symbol": symbol, "productType": PRODUCT_TYPE,
+                "marginCoin": "USDT", "planType": "profit",
+                "holdSide": hold_side, "triggerPrice": str(tp_price),
+                "triggerType": "mark_price", "executePrice": "0",
+            })
+            log.info(f"TP set: {symbol} {hold_side} @ {tp_price}")
+        except Exception as e:
+            log.error(f"TP placement failed {symbol} {hold_side}: {e}")
 
 
-# ── Trade Helpers ──────────────────────────────────────────────────────────────
-def order_size(balance: float, price: float) -> str:
-    usdt = min(balance * RISK_PCT, balance * 0.20)
-    contracts = (usdt * LEVERAGE) / price
-    return f"{contracts:.4f}"
+def execute_open(action: dict, account: dict, memory: dict) -> bool:
+    symbol     = action.get("symbol", "")
+    side       = action.get("side", "long")
+    leverage   = max(1, min(int(action.get("leverage", 5)), 50))
+    size_pct   = min(float(action.get("size_pct", 0.1)), MAX_SIZE_PCT)
+    order_type = action.get("order_type", "market")
+    sl_price   = action.get("sl_price")
+    tp_prices  = action.get("tp_prices", [])
+    limit_px   = action.get("limit_price")
+
+    if not symbol:
+        log.error("OPEN action missing symbol")
+        return False
+
+    available = sf(account.get("available"))
+    usdt      = available * size_pct
+    price     = sf(limit_px) if limit_px else get_mark_price(symbol)
+    if price <= 0:
+        log.error(f"Cannot get price for {symbol}")
+        return False
+
+    contracts = round((usdt * leverage) / price, 4)
+    if contracts <= 0:
+        log.error(f"Computed 0 contracts for {symbol}")
+        return False
+
+    set_leverage(symbol, leverage)
+    api_side = "buy" if side == "long" else "sell"
+
+    result = place_order(symbol, api_side, "open", contracts, order_type, limit_px)
+    log.info(f"OPENED {side.upper()} {symbol} x{leverage} size={contracts} ≈${price:.2f} | {result}")
+
+    time.sleep(2)
+    hold_side = side  # "long" | "short"
+    if sl_price:
+        place_tpsl(symbol, hold_side, sl_price=sl_price)
+    if tp_prices:
+        place_tpsl(symbol, hold_side, tp_price=tp_prices[0])
+
+    # Track in memory
+    key = f"{symbol}_{side}"
+    record_open_trade(memory, key, {
+        "symbol":     symbol,
+        "side":       side,
+        "leverage":   leverage,
+        "size":       contracts,
+        "entry_price": price,
+        "sl_price":   sl_price,
+        "tp_prices":  tp_prices,
+        "opened_at":  datetime.now(timezone.utc).isoformat(),
+        "reasoning":  action.get("reasoning", ""),
+    })
+    return True
 
 
-def calc_tp_sl(entry: float, side: str, atr_val: float) -> tuple:
-    """Returns (tp1, tp2, tp3, sl) as formatted strings using ATR multiples."""
-    d = 1 if side == "buy" else -1
-    tp1 = entry + d * TP1_ATR * atr_val
-    tp2 = entry + d * TP2_ATR * atr_val
-    tp3 = entry + d * TP3_ATR * atr_val
-    sl  = entry - d * SL_ATR  * atr_val
-    return f"{tp1:.2f}", f"{tp2:.2f}", f"{tp3:.2f}", f"{sl:.2f}"
+def execute_close(action: dict, positions: list, memory: dict) -> bool:
+    symbol    = action.get("close_symbol") or action.get("symbol", "")
+    side      = action.get("close_side") or action.get("side", "")
+    close_pct = float(action.get("close_pct", 1.0))
+
+    pos = next((p for p in positions if p["symbol"] == symbol and p["side"] == side), None)
+    if not pos:
+        log.warning(f"No open position found for {symbol} {side}")
+        return False
+
+    close_size = round(sf(pos["available_size"]) * close_pct, 4)
+    api_side   = SIDE_TO_CLOSE[side]
+    place_order(symbol, api_side, "close", close_size)
+    log.info(f"CLOSED {close_pct*100:.0f}% of {side.upper()} {symbol} size={close_size}")
+
+    if close_pct >= 0.99:
+        key = f"{symbol}_{side}"
+        record_closed_trade(memory, key, sf(pos.get("mark_price")), reason=action.get("reasoning", "manual close"))
+
+    return True
 
 
-def fetch_tpsl_orders(symbol: str) -> list:
-    """Returns list of active TP/SL plan orders for the symbol."""
-    try:
-        data = api_get("/api/v2/mix/order/tpsl-order", {
-            "symbol":      symbol,
-            "productType": PRODUCT_TYPE,
-            "isPlan":      "profit_loss",
-        })
-        return data.get("data", {}).get("entrustedList", [])
-    except Exception:
-        return []
+def execute_add(action: dict, account: dict, memory: dict) -> bool:
+    """Add to an existing position — same as open but logs as ADD."""
+    log.info(f"ADD to {action.get('symbol')} {action.get('side')}")
+    return execute_open(action, account, memory)
 
 
-# ── Main Cycle ─────────────────────────────────────────────────────────────────
-def run_cycle(pair: str, daily_loss: float, prev_balance: float, prev_pos_ids: set) -> tuple:
-    """Returns (daily_loss, balance, pos_ids) after the cycle."""
-    log.info(f"── {pair} cycle ──────────────────────────────────────")
+def execute_action(action: dict, account: dict, positions: list, memory: dict):
+    verb = action.get("action", "WAIT")
+    log.info(f"Executing: {verb} | confidence={action.get('confidence')}")
 
-    # 1. Fetch market data
-    candles = fetch_candles(pair, CANDLE_TF, CANDLE_LIMIT)
-    closes, highs, lows = candles["close"], candles["high"], candles["low"]
-    price = closes[-1]
-
-    # 2. Run strategy layers
-    gauss_dir, gauss_count = layer1_gaussian(closes)
-    st = layer2_smart_trend(highs, lows, closes)
-
-    target    = "BULL" if gauss_dir == "RISING" else "BEAR"
-    mtf_count = 0
-    if gauss_count >= GAUSS_BARS and st in ("BULL", "BEAR"):
-        mtf_count = layer3_mtf(pair, target)
-
-    long_ok  = gauss_dir == "RISING"  and gauss_count >= GAUSS_BARS and st == "BULL" and mtf_count >= MTF_MIN_CONFIRM
-    short_ok = gauss_dir == "FALLING" and gauss_count >= GAUSS_BARS and st == "BEAR" and mtf_count >= MTF_MIN_CONFIRM
-    signal   = "LONG" if long_ok else ("SHORT" if short_ok else "NO SIGNAL")
-
-    # 3. Safety checks + daily loss tracking (closed positions only)
-    balance   = fetch_balance()
-    positions = fetch_positions(pair)
-    pos_sides = {p["holdSide"] for p in positions}
-    pos_ids   = {p["posId"] for p in positions if "posId" in p}
-    atr_vals  = calc_atr(highs, lows, closes, ATR_PERIOD)
-    vol       = kmeans_volatility(atr_vals[-100:])
-    atr_val   = float(atr_vals[-1])
-
-    # Detect realised losses from closed positions
-    closed_ids = prev_pos_ids - pos_ids
-    if closed_ids and prev_balance > 0 and balance < prev_balance:
-        daily_loss += prev_balance - balance
-        log.info(f"Closed position detected — realised loss: ${prev_balance - balance:.2f}")
-
-    if balance < MIN_BALANCE:
-        log.warning(f"Balance ${balance:.2f} < minimum ${MIN_BALANCE} — skipping.")
-        signal = "NO SIGNAL"
-    if daily_loss >= DEPOSIT_REF * DAILY_LOSS_PCT:
-        log.warning("Daily loss limit hit — skipping trades.")
-        signal = "NO SIGNAL"
-
-    # 3b. Scan all open positions — apply TP/SL if missing
-    tpsl_actions  = []   # successes
-    tpsl_failures = []   # failures
-    if positions:
-        covered_sides = {o["holdSide"] for o in fetch_tpsl_orders(pair)}
-        for p in positions:
-            h_side = p["holdSide"]   # "long" | "short"
-            if h_side not in covered_sides:
-                try:
-                    entry_px = float(p.get("openPriceAvg", price))
-                    order_side = "buy" if h_side == "long" else "sell"
-                    tp1, tp2, tp3, sl = calc_tp_sl(entry_px, order_side, atr_val)
-                    place_tpsl(pair, h_side, tp=tp3, sl=sl)
-                    msg = f"SET TP/SL on {h_side.upper()} entry={entry_px:.2f} TP={tp3} SL={sl}"
-                    tpsl_actions.append(msg)
-                    log.info(msg)
-                except Exception as e:
-                    msg = f"TPSL FAILED on {h_side.upper()}: {e}"
-                    tpsl_failures.append(msg)
-                    log.error(msg)
-
-    # Block new entry only if same pair + same side already open (or max positions hit)
-    if signal == "LONG"  and "long"  in pos_sides:
-        signal = "NO SIGNAL"   # duplicate long
-    if signal == "SHORT" and "short" in pos_sides:
-        signal = "NO SIGNAL"   # duplicate short
-    if len(positions) >= MAX_POSITIONS:
-        log.info("Max open positions reached — skipping new entry.")
-        signal = "NO SIGNAL"
-
-    # 4. Execute new entry
-    action = "Monitoring"
-    try:
-        if signal == "LONG":
-            set_leverage(pair, LEVERAGE)
-            sz = order_size(balance, price)
-            tp1, tp2, tp3, sl = calc_tp_sl(price, "buy", atr_val)
-            place_order(pair, "buy", sz)
-            time.sleep(2)
-            place_tpsl(pair, "long", tp=tp3, sl=sl)
-            action = f"OPENED LONG  size={sz} TP1={tp1} TP2={tp2} TP3={tp3} SL={sl}"
-
-        elif signal == "SHORT":
-            set_leverage(pair, LEVERAGE)
-            sz = order_size(balance, price)
-            tp1, tp2, tp3, sl = calc_tp_sl(price, "sell", atr_val)
-            place_order(pair, "sell", sz)
-            time.sleep(2)
-            place_tpsl(pair, "short", tp=tp3, sl=sl)
-            action = f"OPENED SHORT size={sz} TP1={tp1} TP2={tp2} TP3={tp3} SL={sl}"
-    except Exception as e:
-        log.error(f"Order execution failed: {e}")
-        action = f"ORDER FAILED: {e}"
-
-    # 5. Status report
-    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    print(f"""
-╔══ CRYPTO INTELLIGENCE AGENT ═══════════════════════════════
-  {ts}
-  Pair:       {pair}  |  Price: ${price:,.2f}
-  Gaussian:   {gauss_dir} ({gauss_count} bars)
-  SmartTrend: {st}
-  MTF Filter: {mtf_count}/{len(MTF_TIMEFRAMES)} confirming {target}
-  Volatility: {vol} cluster
-  Signal:     {signal}
-  Action:     {action}
-  TP/SL scan: {"; ".join(tpsl_actions + tpsl_failures) if (tpsl_actions or tpsl_failures) else "all covered"}
-  Balance:    ${balance:.2f} USDT
-  Positions:  {len(positions)}  ({", ".join(pos_sides) if pos_sides else "None"})
-╚═════════════════════════════════════════════════════════════""", flush=True)
-
-    return daily_loss, balance, pos_ids
+    if verb == "OPEN":
+        execute_open(action, account, memory)
+    elif verb in ("CLOSE", "PARTIAL_CLOSE"):
+        execute_close(action, positions, memory)
+    elif verb == "ADD":
+        execute_add(action, account, memory)
+    elif verb == "WAIT":
+        log.info("WAIT — no action this cycle.")
+    else:
+        log.warning(f"Unknown action: {verb}")
 
 
-# ── Entry Point ────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION G — Logging
+# ══════════════════════════════════════════════════════════════════════════════
+
+def append_agent_log(cycle: int, action: dict, analytics: dict):
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    ts  = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    entry = f"""
+---
+## Cycle {cycle} — {ts}
+
+**Action:** `{action.get('action')}` | **Confidence:** {action.get('confidence')}
+**Symbol:** {action.get('symbol', '—')} | **Side:** {action.get('side', '—')} | **Leverage:** {action.get('leverage', '—')}x
+
+**Analytics snapshot:** {analytics.get('total_trades', 0)} trades | WR {analytics.get('winrate_pct', 0)}% | PnL {analytics.get('total_pnl_usdt', 0):.2f} USDT
+
+### Reasoning
+{action.get('reasoning', '')}
+
+### Self-reflection
+{action.get('self_reflection', '')}
+
+"""
+    with open(LOG_FILE, "a", encoding="utf-8") as f:
+        f.write(entry)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION H — Position sync & main loop
+# ══════════════════════════════════════════════════════════════════════════════
+
+def sync_positions(memory: dict, live_positions: list):
+    """
+    Detect externally closed positions (disappeared from API).
+    Register any live positions not yet tracked in memory.
+    """
+    live_keys = {f"{p['symbol']}_{p['side']}" for p in live_positions}
+    mem_keys  = set(memory.get("open_trades", {}).keys())
+
+    # Closed externally
+    for key in mem_keys - live_keys:
+        trade = memory["open_trades"][key]
+        log.info(f"Externally closed: {key}")
+        # Try to get last mark price from position; fall back to entry
+        exit_px = sf(trade.get("last_mark_price", trade.get("entry_price")))
+        record_closed_trade(memory, key, exit_px, reason="closed externally (TP/SL/manual)")
+
+    # New positions not yet tracked
+    for p in live_positions:
+        key = f"{p['symbol']}_{p['side']}"
+        if key not in memory.get("open_trades", {}):
+            log.info(f"Discovered untracked position: {key}")
+            record_open_trade(memory, key, {
+                "symbol":      p["symbol"],
+                "side":        p["side"],
+                "leverage":    p.get("leverage", 1),
+                "size":        p.get("size"),
+                "entry_price": p.get("entry_price"),
+                "opened_at":   datetime.now(timezone.utc).isoformat(),
+                "reasoning":   "pre-existing or externally opened position",
+            })
+
+    # Update last known mark price for all open positions
+    for p in live_positions:
+        key = f"{p['symbol']}_{p['side']}"
+        if key in memory.get("open_trades", {}):
+            memory["open_trades"][key]["last_mark_price"] = p.get("mark_price")
+
+
 def main():
-    log.info("Crypto Intelligence — Gauss Trading Agent v1.0")
-    log.info(f"Pairs={PAIRS}  TF={CANDLE_TF}  Leverage={LEVERAGE}x  Cycle={CYCLE_SECONDS}s")
+    log.info("=" * 60)
+    log.info("Claude-Brain Trading Agent — Starting")
+    log.info("=" * 60)
 
-    day        = datetime.now(timezone.utc).date()
-    daily_loss = 0.0
-    errors     = 0
-    # Per-pair inter-cycle state for closed-position loss detection
-    pair_state = {pair: {"balance": 0.0, "pos_ids": set()} for pair in PAIRS}
+    memory   = load_memory()
+    cycle    = 0
+
+    # Startup: immediately evaluate all open positions
+    log.info("Startup sync: fetching live positions...")
+    live_positions = fetch_positions()
+    sync_positions(memory, live_positions)
+    save_memory(memory)
+    log.info(f"Startup sync complete. Open positions: {len(live_positions)}")
 
     while True:
-        now_day = datetime.now(timezone.utc).date()
-        if now_day != day:
-            day, daily_loss = now_day, 0.0
-            log.info("New UTC day — daily loss counter reset.")
+        cycle += 1
+        cycle_start = time.time()
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        log.info(f"\n{'='*60}\nCycle {cycle} | {ts}\n{'='*60}")
 
         try:
-            for pair in PAIRS:
-                ps = pair_state[pair]
-                daily_loss, ps["balance"], ps["pos_ids"] = run_cycle(
-                    pair, daily_loss, ps["balance"], ps["pos_ids"]
-                )
-            errors = 0
-        except Exception as e:
-            errors += 1
-            log.error(f"Unhandled error ({errors}/3): {e}", exc_info=True)
-            if errors >= 3:
-                log.critical("3 consecutive errors — agent stopped. Manual intervention required.")
-                raise SystemExit(1)
+            # 1. Account + positions
+            account   = fetch_balance()
+            positions = fetch_positions()
+            log.info(f"Balance: ${account.get('equity', 0):.2f} equity | ${account.get('available', 0):.2f} available")
+            log.info(f"Open positions: {len(positions)}")
 
-        log.info(f"Next cycle in {CYCLE_SECONDS // 60} min...")
-        time.sleep(CYCLE_SECONDS)
+            # 2. Sync memory with reality
+            sync_positions(memory, positions)
+
+            # 3. Collect market data
+            open_symbols = {p["symbol"] for p in positions}
+            market_data  = collect_all_market_data(open_symbols)
+            log.info(f"Market data collected: {market_data.get('total_pairs')} total pairs, {len(market_data.get('deep_data', {}))} deep")
+
+            # 4. Analytics
+            analytics = compute_analytics(memory.get("trades", []))
+
+            # 5. Ask Claude
+            decision = ask_claude(market_data, account, positions, analytics, memory, cycle)
+
+            # 6. Execute
+            execute_action(decision, account, positions, memory)
+
+            # 7. Save + log
+            save_memory(memory)
+            append_agent_log(cycle, decision, analytics)
+
+        except Exception as e:
+            log.error(f"Cycle {cycle} failed: {e}", exc_info=True)
+
+        elapsed  = time.time() - cycle_start
+        sleep_for = max(0, CYCLE_SECONDS - elapsed)
+        log.info(f"Cycle {cycle} done in {elapsed:.0f}s. Next in {sleep_for/60:.1f} min...")
+        time.sleep(sleep_for)
 
 
 if __name__ == "__main__":
