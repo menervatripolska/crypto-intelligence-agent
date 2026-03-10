@@ -11,8 +11,10 @@ import json
 import logging
 import os
 import re
+import threading
 import time
 from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 import anthropic
@@ -843,10 +845,73 @@ def sync_positions(memory: dict, live_positions: list):
             memory["open_trades"][key]["last_mark_price"] = p.get("mark_price")
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION I — HTTP dashboard (read-only)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class DashboardHandler(BaseHTTPRequestHandler):
+    ROUTES = {
+        "/":          ("text/html",             lambda: _index_html()),
+        "/log":       ("text/markdown; charset=utf-8", lambda: _read_file(LOG_FILE)),
+        "/memory":    ("application/json",      lambda: _read_file(MEMORY_FILE)),
+    }
+
+    def do_GET(self):
+        route = self.ROUTES.get(self.path)
+        if not route:
+            self.send_error(404, "Not found")
+            return
+        content_type, reader = route
+        try:
+            body = reader().encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", len(body))
+            self.end_headers()
+            self.wfile.write(body)
+        except Exception as e:
+            self.send_error(500, str(e))
+
+    def log_message(self, fmt, *args):
+        pass   # suppress per-request access logs
+
+
+def _read_file(path: Path) -> str:
+    if path.exists():
+        return path.read_text(encoding="utf-8")
+    return f"{path.name} not found — agent hasn't written it yet."
+
+
+def _index_html() -> str:
+    return """<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<title>Crypto Intelligence Agent</title>
+<style>
+  body{font-family:monospace;background:#0d0d0d;color:#e0e0e0;padding:2rem}
+  h1{color:#00ff88}a{color:#00ccff;font-size:1.2rem;display:block;margin:1rem 0}
+  p{color:#888}
+</style></head><body>
+<h1>Crypto Intelligence — Claude Brain</h1>
+<a href="/log">📋 Agent Log (reasoning per cycle)</a>
+<a href="/memory">🧠 Memory JSON (all trades + analytics)</a>
+<p>Refreshes on page reload. Data written after each 15-min cycle.</p>
+</body></html>"""
+
+
+def start_dashboard(port: int = 8080):
+    server = HTTPServer(("0.0.0.0", port), DashboardHandler)
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    log.info(f"Dashboard running on http://0.0.0.0:{port}")
+
+
 def main():
     log.info("=" * 60)
     log.info("Claude-Brain Trading Agent — Starting")
     log.info("=" * 60)
+
+    port = int(os.environ.get("PORT", 8080))
+    start_dashboard(port)
 
     memory   = load_memory()
     cycle    = 0
