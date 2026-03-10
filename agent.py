@@ -31,14 +31,14 @@ BASE_URL      = "https://api.bitget.com"
 PRODUCT_TYPE  = "USDT-FUTURES"
 CLAUDE_MODEL  = "claude-sonnet-4-20250514"
 CYCLE_SECONDS = 15 * 60
-TOP_PAIRS     = 20          # deep data for top N pairs by 24h volume
+TOP_PAIRS     = 30          # deep data for top N pairs by 24h volume
 MAX_SIZE_PCT  = 0.20        # hard cap: never risk more than 20% per trade
 
 DATA_DIR    = Path(os.environ.get("DATA_DIR", "/data"))
 MEMORY_FILE = DATA_DIR / "memory.json"
 LOG_FILE    = DATA_DIR / "agent_log.md"
 
-CANDLE_CONFIGS = [("15m", 100), ("1H", 100), ("6H", 50), ("12H", 50), ("1D", 30)]
+CANDLE_CONFIGS = [("15m", 50), ("1H", 50), ("6H", 30)]   # compact: 3 TFs only
 
 SIDE_TO_CLOSE = {"long": "sell", "short": "buy"}   # position side → closing order side
 SIDE_TO_HOLD  = {"buy": "long", "sell": "short"}
@@ -281,12 +281,12 @@ def fetch_candles(symbol: str, granularity: str, limit: int) -> list:
     })
     if not rows or not isinstance(rows, list):
         return []
-    rows = list(reversed(rows))
-    return [{"t": r[0], "o": r[1], "h": r[2], "l": r[3], "c": r[4], "v": r[5]} for r in rows]
+    # Compact format: [timestamp, open, high, low, close, volume] — no named keys
+    return [[r[0], r[1], r[2], r[3], r[4], r[5]] for r in reversed(rows)]
 
 
 def fetch_orderbook(symbol: str) -> dict:
-    data = bg_get("/api/v2/mix/market/depth", {
+    data = bg_get("/api/v2/mix/market/merge-depth", {
         "symbol": symbol, "productType": PRODUCT_TYPE, "limit": "20",
     })
     if not data:
@@ -296,11 +296,15 @@ def fetch_orderbook(symbol: str) -> dict:
 
 def fetch_trade_ticks(symbol: str) -> list:
     data = bg_get("/api/v2/mix/market/fills", {
-        "symbol": symbol, "productType": PRODUCT_TYPE, "limit": "100",
+        "symbol": symbol, "productType": PRODUCT_TYPE, "limit": "20",
     })
     if not data or not isinstance(data, list):
         return []
-    return [{"t": t.get("ts"), "p": t.get("price"), "s": t.get("size"), "side": t.get("side")} for t in data]
+    # Compact: [price, size] only — side encoded as negative size for sells
+    return [
+        [t.get("price"), ("-" if t.get("side") == "sell" else "") + str(t.get("size", ""))]
+        for t in data[:20]
+    ]
 
 
 def fetch_funding_rate(symbol: str) -> dict:
@@ -324,18 +328,13 @@ def fetch_open_interest(symbol: str) -> dict:
 
 
 def fetch_ls_ratio(symbol: str) -> dict:
-    data = bg_get("/api/v2/mix/market/account-long-short-ratio", {
-        "symbol": symbol, "productType": PRODUCT_TYPE, "period": "1H",
-    })
-    if not data or not isinstance(data, list) or not data:
-        return {}
-    latest = data[-1]
-    return {"long_pct": latest.get("longAccountRatio"), "short_pct": latest.get("shortAccountRatio")}
+    # account-long-short-ratio does not exist on Bitget v2 — omitted silently
+    return {}
 
 
 def fetch_elite_ratio(symbol: str) -> dict:
     data = bg_get("/api/v2/mix/market/long-short-ratio", {
-        "symbol": symbol, "productType": PRODUCT_TYPE, "period": "1H",
+        "symbol": symbol, "productType": PRODUCT_TYPE, "period": "5min",
     })
     if not data or not isinstance(data, list) or not data:
         return {}
@@ -426,7 +425,8 @@ def collect_deep_data(symbol: str) -> dict:
             result[fname] = None
         time.sleep(0.15)
 
-    return result
+    # Strip null/empty fields to reduce payload size
+    return {k: v for k, v in result.items() if v is not None and v != {} and v != []}
 
 
 def collect_all_market_data(open_symbols: set) -> dict:
@@ -554,20 +554,46 @@ Add these fields only when relevant to your action:
   "close_pct": 0.0-1.0"""
 
 
+def _strip_nulls(obj):
+    """Recursively remove None values and empty dicts/lists to shrink payload."""
+    if isinstance(obj, dict):
+        return {k: _strip_nulls(v) for k, v in obj.items() if v is not None and v != {} and v != []}
+    if isinstance(obj, list):
+        return [_strip_nulls(i) for i in obj if i is not None]
+    return obj
+
+
+def _compact_trade(t: dict) -> list:
+    """Shrink a trade record to [sym, side, entry, exit, pnl_usdt, pnl_pct, hours, outcome]."""
+    return [
+        t.get("symbol"), t.get("side"),
+        t.get("entry_price"), t.get("exit_price"),
+        t.get("pnl_usdt"), t.get("pnl_pct"),
+        t.get("holding_hours"), t.get("outcome"),
+    ]
+
+
 def ask_claude(market_data: dict, account: dict, positions: list, analytics: dict, memory: dict, cycle: int) -> dict:
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
+    all_trades = memory.get("trades", [])
+    compact_analytics = {k: v for k, v in analytics.items() if k not in ("best_trades", "worst_trades", "last_10_trades")}
+    compact_analytics["best_trades"]  = [_compact_trade(t) for t in analytics.get("best_trades", [])]
+    compact_analytics["worst_trades"] = [_compact_trade(t) for t in analytics.get("worst_trades", [])]
+    compact_analytics["last_30_trades"] = [_compact_trade(t) for t in all_trades[-30:]]
+    compact_analytics["trade_columns"] = ["symbol","side","entry","exit","pnl_usdt","pnl_pct","hours","outcome"]
+
     payload = {
-        "cycle":           cycle,
-        "timestamp_utc":   datetime.now(timezone.utc).isoformat(),
-        "account":         account,
-        "open_positions":  positions,
+        "cycle":              cycle,
+        "ts":                 datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+        "account":            account,
+        "open_positions":     positions,
         "open_trades_memory": memory.get("open_trades", {}),
-        "analytics":       analytics,
-        "market":          market_data,
+        "analytics":          compact_analytics,
+        "market":             _strip_nulls(market_data),
     }
 
-    user_msg = json.dumps(payload, default=str)
+    user_msg = json.dumps(payload, separators=(",", ":"), default=str)
     log.info(f"Sending {len(user_msg):,} chars to Claude...")
 
     response = client.messages.create(
