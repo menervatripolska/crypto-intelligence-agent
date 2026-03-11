@@ -661,6 +661,67 @@ def analyze_historical_patterns(symbol: str, deep: dict) -> dict:
     return {"symbol": symbol, "candles_analyzed": n, "patterns": patterns}
 
 
+def get_macro_calendar() -> str:
+    """Fetch high-impact economic events for the next 48 hours from ForexFactory."""
+    try:
+        r = requests.get(
+            "https://nfs.faireconomy.media/ff_calendar_thisweek.json",
+            timeout=10,
+        )
+        events = r.json()
+        if not isinstance(events, list):
+            return ""
+
+        now        = datetime.now(timezone.utc)
+        cutoff     = now.timestamp() + 48 * 3600
+        hi_nations = {"USD", "EUR", "GBP", "CNY", "JPY"}
+
+        filtered = []
+        for ev in events:
+            if ev.get("impact") != "High":
+                continue
+            if ev.get("country") not in hi_nations:
+                continue
+            raw_date = ev.get("date", "")
+            try:
+                # ForexFactory dates arrive as "2026-03-12T14:00:00-05:00" or similar
+                from datetime import timezone as _tz
+                import re as _re
+                # Normalise offset: replace e.g. "-05:00" → parse manually
+                dt = datetime.fromisoformat(raw_date)
+                # Convert to UTC
+                dt_utc = dt.astimezone(timezone.utc)
+            except Exception:
+                continue
+            ts = dt_utc.timestamp()
+            if ts < now.timestamp() or ts > cutoff:
+                continue
+            hours_away = (ts - now.timestamp()) / 3600
+            filtered.append((hours_away, dt_utc, ev))
+
+        if not filtered:
+            return "=== MACRO CALENDAR === No high-impact events in next 48h."
+
+        filtered.sort(key=lambda x: x[0])
+
+        lines = ["=== MACRO CALENDAR (next 48h, high impact only) ==="]
+        for hours_away, dt_utc, ev in filtered:
+            h = int(hours_away)
+            label   = f"IN {h}h" if h > 0 else "NOW"
+            country = ev.get("country", "")
+            title   = ev.get("title", "")
+            fore    = ev.get("forecast") or "--"
+            prev    = ev.get("previous") or "--"
+            lines.append(f"[{label}] 🔴 {country} — {title} | Forecast: {fore} | Prev: {prev}")
+
+        result = "\n".join(lines)
+        log.info(f"Macro calendar: {len(filtered)} high-impact events in next 48h")
+        return result
+    except Exception as e:
+        log.warning(f"get_macro_calendar failed: {e}")
+        return ""
+
+
 def fetch_market_intelligence() -> dict:
     """Fetch external macro/sentiment data every cycle. All failures return None — never block the cycle."""
     result = {}
@@ -728,6 +789,8 @@ def fetch_market_intelligence() -> dict:
     except Exception as e:
         log.warning(f"Macro fetch failed: {e}")
         result["macro"] = None
+
+    result["macro_calendar"] = get_macro_calendar()
 
     return result
 
@@ -1108,6 +1171,7 @@ def ask_claude(market_data: dict, account: dict, positions: list, analytics: dic
         "analytics":            compact_analytics,
         "historical_patterns":  market_data.get("historical_patterns", {}),
         "market_intelligence":  market_intelligence or {},
+        "macro_calendar":       (market_intelligence or {}).get("macro_calendar", ""),
         "episodic_memory":      episodic_section,
         "market":               _strip_nulls({k: v for k, v in market_data.items() if k != "historical_patterns"}),
     }
