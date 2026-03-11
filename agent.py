@@ -854,7 +854,7 @@ def place_tpsl(symbol: str, hold_side: str, sl_price: float = None, tp_price: fl
         try:
             bg_post("/api/v2/mix/order/place-tpsl-order", {
                 "symbol": symbol, "productType": PRODUCT_TYPE,
-                "marginCoin": "USDT", "planType": "loss",
+                "marginCoin": "USDT", "planType": "pos_loss",
                 "holdSide": hold_side, "triggerPrice": str(sl_price),
                 "triggerType": "mark_price", "executePrice": "0",
             })
@@ -866,13 +866,63 @@ def place_tpsl(symbol: str, hold_side: str, sl_price: float = None, tp_price: fl
         try:
             bg_post("/api/v2/mix/order/place-tpsl-order", {
                 "symbol": symbol, "productType": PRODUCT_TYPE,
-                "marginCoin": "USDT", "planType": "profit",
+                "marginCoin": "USDT", "planType": "pos_profit",
                 "holdSide": hold_side, "triggerPrice": str(tp_price),
                 "triggerType": "mark_price", "executePrice": "0",
             })
             log.info(f"TP set: {symbol} {hold_side} @ {tp_price}")
         except Exception as e:
             log.error(f"TP placement failed {symbol} {hold_side}: {e}")
+
+
+def ensure_stops(positions: list):
+    """
+    Position guardian: runs every cycle before Claude.
+    For each open position, checks existing TP/SL plan orders.
+    If missing, places defaults automatically.
+    """
+    for pos in positions:
+        symbol     = pos["symbol"]
+        hold_side  = pos["side"]          # "long" or "short"
+        entry      = pos.get("entry_price", 0.0)
+        if not entry:
+            log.warning(f"Guardian: no entry_price for {symbol} {hold_side}, skipping")
+            continue
+
+        # Fetch existing TP/SL plan orders for this position
+        has_sl = False
+        has_tp = False
+        try:
+            data = bg_get("/api/v2/mix/order/plan-order-tpsl", {
+                "symbol": symbol, "productType": PRODUCT_TYPE,
+            })
+            orders = data if isinstance(data, list) else (data or {}).get("entrustedList", []) if data else []
+            for o in orders:
+                pt = o.get("planType", "")
+                if pt in ("pos_loss", "loss"):
+                    has_sl = True
+                if pt in ("pos_profit", "profit"):
+                    has_tp = True
+        except Exception as e:
+            log.warning(f"Guardian: could not fetch plan orders for {symbol}: {e}")
+            continue
+
+        # Compute default SL/TP prices
+        if hold_side == "long":
+            default_sl = round(entry * 0.985, 4)   # 1.5% below entry
+            default_tp = round(entry * 1.030, 4)   # 3.0% above entry
+        else:
+            default_sl = round(entry * 1.015, 4)   # 1.5% above entry
+            default_tp = round(entry * 0.970, 4)   # 3.0% below entry
+
+        if not has_sl:
+            log.info(f"Guardian: placing SL for {symbol} {hold_side} @ {default_sl}")
+            place_tpsl(symbol, hold_side, sl_price=default_sl)
+        if not has_tp:
+            log.info(f"Guardian: placing TP for {symbol} {hold_side} @ {default_tp}")
+            place_tpsl(symbol, hold_side, tp_price=default_tp)
+        if has_sl and has_tp:
+            log.info(f"Guardian: {symbol} {hold_side} already has SL+TP, no action needed")
 
 
 def execute_open(action: dict, account: dict, memory: dict) -> bool:
@@ -1268,6 +1318,13 @@ def trading_loop():
             log.info(f"Open positions: {len(positions)}")
 
             sync_positions(memory, positions)
+
+            # Guardian: ensure every open position has SL+TP before Claude runs
+            if positions:
+                try:
+                    ensure_stops(positions)
+                except Exception as e:
+                    log.warning(f"ensure_stops failed (non-fatal): {e}", exc_info=True)
 
             open_symbols = {p["symbol"] for p in positions}
             market_data  = collect_all_market_data(open_symbols)
