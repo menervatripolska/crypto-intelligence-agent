@@ -711,14 +711,23 @@ FREEDOMS:
 OUTPUT FORMAT — return ONLY valid JSON, no markdown outside it
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-Single action:
+Before the debate, complete all 6 analysis steps. Then run the debate. Both go in the JSON.
+
 {
+  "steps": {
+    "step1": "MARKET STRUCTURE: regime, multi-timeframe read, smart money positioning, key levels",
+    "step2": "OPPORTUNITY SCAN: best setup across all pairs, why this pair over others",
+    "step3": "SELF REFLECTION: patterns that worked/failed, were last decisions correct, what to change",
+    "step4": "PROBABILITY: probability of profit for best setup, expected value of acting vs waiting",
+    "step5": "DECISION: asset, direction, leverage, size, SL, TP, order type, single vs multiple actions",
+    "step6": "SELF ORGANIZATION: current edge, is approach working, what to watch next cycle"
+  },
   "debate": {
-    "viktor": "Viktor's argument — specific pair, setup, reasoning",
-    "yu": "Yu's argument — short case or bear rebuttal",
-    "sara": "Sara's momentum read across pairs",
-    "mikhail": "Mikhail's numbers — size_pct, leverage, sl, tp, R:R. Approved or rejected.",
-    "ori": "Ori's final ruling — who won the debate and why"
+    "viktor": "Viktor's argument — specific pair, setup, entry level, why long now",
+    "yu": "Yu's argument — short case or bear rebuttal with specific pair",
+    "sara": "Sara's momentum read — what is moving hardest right now and direction",
+    "mikhail": "Mikhail's numbers — exact size_pct, leverage, sl_price, tp_prices, R:R ratio. APPROVED or REJECTED.",
+    "ori": "Ori's final ruling — who won, why, what we do"
   },
   "action": "OPEN|CLOSE|PARTIAL_CLOSE|ADD|WAIT",
   "symbol": "BTCUSDT",
@@ -734,12 +743,13 @@ Single action:
   "close_side": "long|short",
   "close_pct": 1.0,
   "confidence": 0.72,
-  "reasoning": "Ori's summary of the debate outcome",
-  "self_reflection": "what the desk learned this cycle"
+  "reasoning": "Ori's one-paragraph summary for the log",
+  "self_reflection": "what the desk learned and will do differently"
 }
 
 Multiple actions (close + open, or open multiple pairs):
 {
+  "steps": { "step1": "...", "step2": "...", "step3": "...", "step4": "...", "step5": "...", "step6": "..." },
   "debate": { "viktor": "...", "yu": "...", "sara": "...", "mikhail": "...", "ori": "..." },
   "actions": [
     {"action": "CLOSE", "close_symbol": "BTCUSDT", "close_side": "long", "close_pct": 1.0},
@@ -796,7 +806,7 @@ def ask_claude(market_data: dict, account: dict, positions: list, analytics: dic
 
     response = client.messages.create(
         model=CLAUDE_MODEL,
-        max_tokens=4000,
+        max_tokens=6000,
         system=SYSTEM_PROMPT,
         messages=[{"role": "user", "content": user_msg}],
     )
@@ -1155,6 +1165,7 @@ def execute_action(action: dict, account: dict, positions: list, memory: dict):
 def append_agent_log(cycle: int, action: dict, analytics: dict):
     log.info(f"append_agent_log: writing to {LOG_FILE} (DATA_DIR={DATA_DIR})")
     ts     = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    steps  = action.get("steps") or {}
     debate = action.get("debate") or {}
 
     # Determine symbol/side from single action or first action in array
@@ -1163,6 +1174,30 @@ def append_agent_log(cycle: int, action: dict, analytics: dict):
     side   = action.get("side") or (acts[0].get("side") or acts[0].get("close_side") if acts else "—")
     verb   = action.get("action") or ("MULTI" if acts else "—")
     lev    = action.get("leverage", "—")
+
+    steps_md = ""
+    if steps:
+        steps_md = f"""
+### 🧠 Analysis
+
+**Step 1 — Market Structure**
+{steps.get('step1', '—')}
+
+**Step 2 — Opportunity Scan**
+{steps.get('step2', '—')}
+
+**Step 3 — Self Reflection**
+{steps.get('step3', '—')}
+
+**Step 4 — Probability Assessment**
+{steps.get('step4', '—')}
+
+**Step 5 — Decision**
+{steps.get('step5', '—')}
+
+**Step 6 — Self Organization**
+{steps.get('step6', '—')}
+"""
 
     debate_md = ""
     if debate:
@@ -1192,7 +1227,7 @@ def append_agent_log(cycle: int, action: dict, analytics: dict):
 **Decision:** `{verb}` | **Confidence:** {action.get('confidence')} | **Symbol:** {symbol} | **Side:** {side} | **Leverage:** {lev}x
 
 **Account:** {analytics.get('total_trades', 0)} trades | WR {analytics.get('winrate_pct', 0)}% | PnL {analytics.get('total_pnl_usdt', 0):.2f} USDT
-{debate_md}
+{steps_md}{debate_md}
 ### 📋 Ori's Ruling
 {action.get('reasoning', '')}
 
