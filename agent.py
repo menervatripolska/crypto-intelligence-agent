@@ -552,6 +552,77 @@ def analyze_historical_patterns(symbol: str, deep: dict) -> dict:
     return {"symbol": symbol, "candles_analyzed": n, "patterns": patterns}
 
 
+def fetch_market_intelligence() -> dict:
+    """Fetch external macro/sentiment data every cycle. All failures return None — never block the cycle."""
+    result = {}
+
+    # ── Fear & Greed Index (alternative.me)
+    try:
+        r = requests.get("https://api.alternative.me/fng/?limit=7", timeout=10)
+        fng = r.json().get("data", [])
+        result["fear_greed"] = {
+            "today":     int(fng[0]["value"]) if len(fng) > 0 else None,
+            "label":     fng[0]["value_classification"] if len(fng) > 0 else None,
+            "yesterday": int(fng[1]["value"]) if len(fng) > 1 else None,
+            "week_ago":  int(fng[6]["value"]) if len(fng) > 6 else None,
+        }
+        log.info(f"Fear&Greed: {result['fear_greed']}")
+    except Exception as e:
+        log.warning(f"Fear&Greed fetch failed: {e}")
+        result["fear_greed"] = None
+
+    # ── BTC Liquidations (Bitget public endpoint)
+    try:
+        r = requests.get(
+            "https://api.bitget.com/api/v2/mix/market/liquidation-orders",
+            params={"symbol": "BTCUSDT", "productType": "USDT-FUTURES", "pageSize": "50"},
+            timeout=10,
+        )
+        d = r.json()
+        orders = d.get("data", {})
+        if isinstance(orders, dict):
+            orders = orders.get("liquidationOrderList", [])
+        longs_usd  = sum(sf(o.get("size", 0)) * sf(o.get("fillPrice", 0))
+                         for o in orders if o.get("side") in ("buy", "long"))
+        shorts_usd = sum(sf(o.get("size", 0)) * sf(o.get("fillPrice", 0))
+                         for o in orders if o.get("side") in ("sell", "short"))
+        result["liquidations_btc"] = {
+            "longs_usd":  round(longs_usd),
+            "shorts_usd": round(shorts_usd),
+        }
+        log.info(f"Liquidations BTC: {result['liquidations_btc']}")
+    except Exception as e:
+        log.warning(f"Liquidations fetch failed: {e}")
+        result["liquidations_btc"] = None
+
+    # ── Macro: DXY + S&P 500 (Yahoo Finance)
+    def _yahoo_change(ticker: str) -> dict:
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?interval=1d&range=5d"
+        r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+        chart = r.json()["chart"]["result"][0]
+        closes = chart["indicators"]["quote"][0]["close"]
+        closes = [c for c in closes if c is not None]
+        if len(closes) < 2:
+            return {}
+        change_pct = (closes[-1] - closes[0]) / closes[0] * 100
+        return {
+            "change_5d": f"{change_pct:+.2f}%",
+            "trend":     "rising" if change_pct > 0 else "falling",
+        }
+
+    try:
+        result["macro"] = {
+            "dxy":   _yahoo_change("DX-Y.NYB"),
+            "sp500": _yahoo_change("%5EGSPC"),
+        }
+        log.info(f"Macro: {result['macro']}")
+    except Exception as e:
+        log.warning(f"Macro fetch failed: {e}")
+        result["macro"] = None
+
+    return result
+
+
 def collect_deep_data(symbol: str) -> dict:
     """All per-symbol deep data. Each fetch is isolated — failures stored as None."""
     result = {}
@@ -710,6 +781,22 @@ These are measured frequencies, not estimates. Confidence MUST be anchored to th
 If momentum continuation rate is 67% — confidence ceiling is 0.67 unless other factors raise it.
 Conflicting patterns (bullish momentum + high rejection rate at level) → lower confidence, smaller size.
 
+MARKET INTELLIGENCE — REAL external data, updated every cycle:
+The payload contains "market_intelligence" with live data from outside Bitget.
+ALL characters and ALL 6 reasoning steps MUST reference this data explicitly.
+NEVER invent numbers not present in the provided data.
+
+Interpretation rules:
+- fear_greed.today < 30 = Extreme Fear = potential reversal / long opportunity (contrarian)
+- fear_greed.today > 70 = Greed = caution on longs, consider shorts
+- fear_greed trend (today vs week_ago): improving or deteriorating sentiment
+- macro.dxy rising = USD strengthening = headwind for crypto prices
+- macro.dxy falling = USD weakening = tailwind for crypto prices
+- macro.sp500 falling = risk-off = crypto likely to follow
+- macro.sp500 rising = risk-on = crypto tailwind
+- liquidations_btc.longs_usd >> shorts_usd = forced long liquidations = selling pressure
+- liquidations_btc.shorts_usd >> longs_usd = forced short liquidations = buying pressure (short squeeze)
+
 FREEDOMS:
 - Leverage: 2x–20x, you choose per trade based on conviction
 - Size: 5%–50% of available balance, conviction-based
@@ -790,7 +877,7 @@ def _compact_trade(t: dict) -> list:
     ]
 
 
-def ask_claude(market_data: dict, account: dict, positions: list, analytics: dict, memory: dict, cycle: int) -> dict:
+def ask_claude(market_data: dict, account: dict, positions: list, analytics: dict, memory: dict, cycle: int, market_intelligence: dict = None) -> dict:
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
     all_trades = memory.get("trades", [])
@@ -801,14 +888,15 @@ def ask_claude(market_data: dict, account: dict, positions: list, analytics: dic
     compact_analytics["trade_columns"] = ["symbol","side","entry","exit","pnl_usdt","pnl_pct","hours","outcome"]
 
     payload = {
-        "cycle":               cycle,
-        "ts":                  datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
-        "account":             account,
-        "open_positions":      positions,
-        "open_trades_memory":  memory.get("open_trades", {}),
-        "analytics":           compact_analytics,
-        "historical_patterns": market_data.get("historical_patterns", {}),
-        "market":              _strip_nulls({k: v for k, v in market_data.items() if k != "historical_patterns"}),
+        "cycle":                cycle,
+        "ts":                   datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+        "account":              account,
+        "open_positions":       positions,
+        "open_trades_memory":   memory.get("open_trades", {}),
+        "analytics":            compact_analytics,
+        "historical_patterns":  market_data.get("historical_patterns", {}),
+        "market_intelligence":  market_intelligence or {},
+        "market":               _strip_nulls({k: v for k, v in market_data.items() if k != "historical_patterns"}),
     }
 
     user_msg = json.dumps(payload, separators=(",", ":"), default=str)
@@ -1387,12 +1475,13 @@ def trading_loop():
                 except Exception as e:
                     log.warning(f"ensure_stops failed (non-fatal): {e}", exc_info=True)
 
-            open_symbols = {p["symbol"] for p in positions}
-            market_data  = collect_all_market_data(open_symbols)
+            open_symbols        = {p["symbol"] for p in positions}
+            market_data         = collect_all_market_data(open_symbols)
+            market_intelligence = fetch_market_intelligence()
             log.info(f"Market data collected: {market_data.get('total_pairs')} total pairs, {len(market_data.get('deep_data', {}))} deep")
 
             analytics = compute_analytics(memory.get("trades", []))
-            decision  = ask_claude(market_data, account, positions, analytics, memory, cycle)
+            decision  = ask_claude(market_data, account, positions, analytics, memory, cycle, market_intelligence)
 
             try:
                 execute_action(decision, account, positions, memory)
