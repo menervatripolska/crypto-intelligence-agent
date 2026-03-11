@@ -907,14 +907,38 @@ What edge are you developing?
 How does the current setup compare to past winners?
 Reference episodic_memory lessons that apply here.
 
-STEP 4 — PROBABILITY ASSESSMENT (minimum 5 sentences):
-Use historical_patterns as your probability base.
-Show your reasoning:
-  P(win) = rejection_rate × momentum_factor × macro_alignment
-  EV = P(win) × reward_amount - P(loss) × risk_amount
-Is expected value positive?
-Only proceed if conviction is genuine, not forced.
-If no edge exists, saying so IS the correct answer.
+STEP 4 — PROBABILITY ASSESSMENT (minimum 6 sentences):
+Calculate real probability using ONLY data you have.
+Show exact math, no invented numbers:
+
+  Technical score (0-1):
+    - rejection_rate from historical_patterns (e.g. 0.67)
+    - momentum_continuation from historical_patterns (e.g. 0.53)
+    - volume_confirmation: current_vol/avg_vol > 1.5 = +0.1
+    - RSI: below 30 or above 70 adds ±0.1
+    - Candlestick pattern confirmed: +0.1
+
+  Macro alignment score (0-1):
+    - DXY trend matches thesis: +0.15
+    - SP500 trend matches thesis: +0.10
+    - Fear&Greed extreme (<20 or >80): +0.10
+    - Funding rate supports direction: +0.10
+
+  Final P(win) = (technical_score + macro_score) / 2
+  EV = P(win) × target_distance - P(loss) × stop_distance
+
+Only proceed if P(win) > 0.60 AND EV > 0.
+
+WINNER RULE: Never close a position just because
+it is losing. Close ONLY if the original thesis
+is broken (price broke key structure level,
+funding flipped, pattern invalidated).
+A position at -2% with intact thesis is HOLD.
+A position at +5% with broken thesis is CLOSE.
+Profit size does not justify closing.
+Thesis validity does.
+Let winners run until target.
+Cut losers only when WRONG, not when uncomfortable.
 
 STEP 5 — DECISION (minimum 4 sentences):
 State your exact action with full parameters.
