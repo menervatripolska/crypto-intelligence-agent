@@ -513,6 +513,30 @@ SYSTEM_PROMPT = """You are a senior quantitative trader and risk manager with de
 
 Your singular goal: grow this account through high-probability profitable trades.
 
+YOUR FREEDOMS — these are not restrictions, they are your tools:
+
+LEVERAGE: You choose leverage for each trade based on your analysis. There is no fixed leverage.
+- 2x–5x for low-confidence or choppy setups
+- 5x–10x for clear trending setups with confirmation
+- 10x–20x for very high confidence setups with tight structure
+Maximize expected profit while keeping liquidation probability near zero.
+
+POSITION SIZE: You choose size each trade. Not every trade is equal.
+- 5%–15% of available balance for low-confidence setups
+- 15%–30% for solid setups
+- 30%–50% for your highest-conviction trades
+Size reflects your conviction. Do not flat-size every trade.
+
+MULTIPLE POSITIONS: You can hold multiple simultaneous positions across different pairs. No artificial limit.
+If two pairs each have a high-probability setup — open both. Diversification of edge is profit maximization.
+
+OPEN WHILE LOSING: You CAN and SHOULD open new positions even when you have losing open positions.
+A losing BTCUSDT trade does not prevent a profitable ETHUSDT trade. Evaluate each opportunity independently.
+Do not wait for losing positions to close before entering new ones.
+
+CLOSE AND OPEN SAME CYCLE: If you have a losing position AND see a profitable new opportunity, do both in the same cycle.
+Return an "actions" array with multiple decisions: close the loser AND open the new trade simultaneously.
+
 BEFORE EVERY DECISION think step by step:
 
 STEP 1 - MARKET STRUCTURE ANALYSIS:
@@ -525,6 +549,7 @@ STEP 2 - OPPORTUNITY SCAN:
 Scan all available pairs.
 Which pair has the clearest highest probability setup right now?
 Why this pair over all others?
+Are there multiple high-probability setups across different pairs?
 
 STEP 3 - SELF REFLECTION ON HISTORY:
 Review your complete trade history.
@@ -542,17 +567,17 @@ Is this probability clearly above 60%? If not - WAIT.
 STEP 5 - DECISION AND EXECUTION:
 Based on steps 1-4 make your decision:
 - Whether to trade or not: only if probability clearly favors profit.
-- Which asset: highest probability opportunity from full pair scan.
+- Which asset(s): highest probability opportunities from full pair scan.
 - Direction long or short: which has higher probability given full analysis.
-- Leverage: maximizes expected profit while keeping liquidation probability near zero.
-- Position size: optimal for this setup probability and account balance.
+- Leverage: your choice per trade — 2x to 20x based on confidence.
+- Position size: your choice per trade — 5% to 50% of available balance based on conviction.
 - Stop loss or not and where: does it increase expected profit?
 - Take profit or not and where: does it increase expected profit? How many levels?
 - Market or limit order: which gives better expected fill?
-- How many positions: does more increase total expected profit or dilute edge?
 - Close early: has market structure changed on open positions? Close now if better for total profit.
 - Add to position: does adding increase expected profit of total position?
 - Do nothing: is WAIT the highest expected value action?
+- Multiple actions: if closing one and opening another, use the "actions" array.
 
 STEP 6 - SELF ORGANIZATION:
 After your decision reflect: What is your current edge in this market? Is your approach working or does it need to evolve? What will you watch for in the next cycle?
@@ -562,26 +587,37 @@ Once you decide - ACT immediately. Do not second guess. You analyzed, you decide
 Capital preservation IS profit maximization. Never trade just to trade. Patience is your edge when market is unclear.
 
 Return ONLY valid JSON. No markdown, no explanation outside JSON.
-Minimum required fields:
+
+Single action format:
 {
   "action": "OPEN|CLOSE|PARTIAL_CLOSE|ADD|WAIT",
   "reasoning": "full step by step analysis",
   "self_reflection": "what you learned and how approach evolves",
-  "confidence": 0.0-1.0
-}
-Add these fields only when relevant to your action:
+  "confidence": 0.0-1.0,
   "symbol": "e.g. BTCUSDT",
   "side": "long or short",
-  "leverage": integer,
-  "size_pct": 0.0-1.0 fraction of available balance,
+  "leverage": integer (2-20, your choice),
+  "size_pct": 0.05-0.50 fraction of available balance,
   "order_type": "market or limit",
   "limit_price": float,
   "sl_price": float,
   "tp_prices": [float, ...],
-  "tp_sizes": [0.0-1.0, ...] fractions summing to <=1.0,
-  "close_symbol": "symbol of position to close",
+  "tp_sizes": [0.0-1.0, ...],
+  "close_symbol": "symbol to close",
   "close_side": "long or short",
-  "close_pct": 0.0-1.0"""
+  "close_pct": 0.0-1.0
+}
+
+Multiple actions format (close + open same cycle, or open multiple):
+{
+  "actions": [
+    {"action": "CLOSE", "close_symbol": "BTCUSDT", "close_side": "long", "close_pct": 1.0},
+    {"action": "OPEN", "symbol": "ETHUSDT", "side": "short", "leverage": 8, "size_pct": 0.20, ...}
+  ],
+  "reasoning": "full analysis",
+  "self_reflection": "...",
+  "confidence": 0.0-1.0
+}"""
 
 
 def _strip_nulls(obj):
@@ -662,7 +698,7 @@ def set_leverage(symbol: str, leverage: int):
         log.warning(f"set_leverage {symbol} x{leverage} failed (may already be set): {e}")
 
 
-def place_order(symbol: str, side: str, trade_side: str, size: float, order_type: str = "market", price: float = None) -> dict:
+def place_order(symbol: str, side: str, trade_side: str, size: float, order_type: str = "market", price: float = None, raw_close: bool = False) -> dict:
     body = {
         "symbol":      symbol,
         "productType": PRODUCT_TYPE,
@@ -670,11 +706,13 @@ def place_order(symbol: str, side: str, trade_side: str, size: float, order_type
         "marginCoin":  "USDT",
         "size":        str(size),
         "side":        side,          # "buy" | "sell"
-        "tradeSide":   trade_side,    # "open" | "close"
         "orderType":   order_type,
     }
+    if not raw_close:
+        body["tradeSide"] = trade_side  # "open" | "close"
     if order_type == "limit" and price:
         body["price"] = str(price)
+    log.info(f"place_order body: {body}")
     return bg_post("/api/v2/mix/order/place-order", body) or {}
 
 
@@ -772,8 +810,9 @@ def execute_close(action: dict, positions: list, memory: dict) -> bool:
 
     close_size = round(sf(pos["available_size"]) * close_pct, 4)
     api_side   = SIDE_TO_CLOSE[side]
-    place_order(symbol, api_side, "close", close_size)
-    log.info(f"CLOSED {close_pct*100:.0f}% of {side.upper()} {symbol} size={close_size}")
+    # One-way mode: plain market order with no tradeSide/holdSide/reduceOnly
+    log.info(f"CLOSE {close_pct*100:.0f}% of {side.upper()} {symbol}: side={api_side} size={close_size} (raw market, no tradeSide)")
+    place_order(symbol, api_side, "close", close_size, raw_close=True)
 
     if close_pct >= 0.99:
         key = f"{symbol}_{side}"
@@ -788,10 +827,9 @@ def execute_add(action: dict, account: dict, memory: dict) -> bool:
     return execute_open(action, account, memory)
 
 
-def execute_action(action: dict, account: dict, positions: list, memory: dict):
+def _dispatch(action: dict, account: dict, positions: list, memory: dict):
+    """Dispatch a single action dict."""
     verb = action.get("action", "WAIT")
-    log.info(f"Executing: {verb} | confidence={action.get('confidence')}")
-
     if verb == "OPEN":
         execute_open(action, account, memory)
     elif verb in ("CLOSE", "PARTIAL_CLOSE"):
@@ -802,6 +840,22 @@ def execute_action(action: dict, account: dict, positions: list, memory: dict):
         log.info("WAIT — no action this cycle.")
     else:
         log.warning(f"Unknown action: {verb}")
+
+
+def execute_action(action: dict, account: dict, positions: list, memory: dict):
+    log.info(f"Executing decision | confidence={action.get('confidence')}")
+
+    # Multi-action path: Claude returned {"actions": [...], ...}
+    actions = action.get("actions")
+    if actions and isinstance(actions, list):
+        log.info(f"Multi-action: {len(actions)} steps")
+        for i, a in enumerate(actions):
+            log.info(f"  Step {i+1}: {a.get('action')}")
+            _dispatch(a, account, positions, memory)
+        return
+
+    # Single-action path
+    _dispatch(action, account, positions, memory)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
