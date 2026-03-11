@@ -848,6 +848,17 @@ def place_order(symbol: str, side: str, trade_side: str, size: float, order_type
     return bg_post("/api/v2/mix/order/place-order", body) or {}
 
 
+def round_price(symbol: str, price: float) -> float:
+    precision = {
+        "BTCUSDT": 1,
+        "ETHUSDT": 2,
+        "SOLUSDT": 3,
+        "BNBUSDT": 2,
+    }
+    decimals = precision.get(symbol, 2)
+    return round(float(price), decimals)
+
+
 def place_tpsl(symbol: str, hold_side: str, sl_price: float = None, tp_price: float = None):
     """Place SL and/or TP plan orders on an open position."""
     if sl_price:
@@ -855,7 +866,7 @@ def place_tpsl(symbol: str, hold_side: str, sl_price: float = None, tp_price: fl
             bg_post("/api/v2/mix/order/place-tpsl-order", {
                 "symbol": symbol, "productType": PRODUCT_TYPE,
                 "marginCoin": "USDT", "planType": "pos_loss",
-                "holdSide": hold_side, "triggerPrice": str(sl_price),
+                "holdSide": hold_side, "triggerPrice": str(round_price(symbol, sl_price)),
                 "triggerType": "mark_price", "executePrice": "0",
             })
             log.info(f"SL set: {symbol} {hold_side} @ {sl_price}")
@@ -867,7 +878,7 @@ def place_tpsl(symbol: str, hold_side: str, sl_price: float = None, tp_price: fl
             bg_post("/api/v2/mix/order/place-tpsl-order", {
                 "symbol": symbol, "productType": PRODUCT_TYPE,
                 "marginCoin": "USDT", "planType": "pos_profit",
-                "holdSide": hold_side, "triggerPrice": str(tp_price),
+                "holdSide": hold_side, "triggerPrice": str(round_price(symbol, tp_price)),
                 "triggerType": "mark_price", "executePrice": "0",
             })
             log.info(f"TP set: {symbol} {hold_side} @ {tp_price}")
@@ -893,27 +904,32 @@ def ensure_stops(positions: list):
         has_sl = False
         has_tp = False
         try:
-            data = bg_get("/api/v2/mix/order/plan-order-tpsl", {
-                "symbol": symbol, "productType": PRODUCT_TYPE,
-            })
-            orders = data if isinstance(data, list) else (data or {}).get("entrustedList", []) if data else []
-            for o in orders:
-                pt = o.get("planType", "")
-                if pt in ("pos_loss", "loss"):
-                    has_sl = True
-                if pt in ("pos_profit", "profit"):
-                    has_tp = True
+            def _get_orders(plan_type: str) -> list:
+                data = bg_get("/api/v2/mix/order/orders-plan-pending", {
+                    "symbol": symbol, "productType": PRODUCT_TYPE, "planType": plan_type,
+                })
+                if isinstance(data, list):
+                    return data
+                if isinstance(data, dict):
+                    return data.get("entrustedList", [])
+                return []
+
+            sl_orders = _get_orders("pos_loss")
+            tp_orders = _get_orders("pos_profit")
+            has_sl = len(sl_orders) > 0
+            has_tp = len(tp_orders) > 0
+            log.info(f"Guardian: {symbol} {hold_side} — SL orders={len(sl_orders)} TP orders={len(tp_orders)}")
         except Exception as e:
             log.warning(f"Guardian: could not fetch plan orders for {symbol}: {e}")
             continue
 
-        # Compute default SL/TP prices
+        # Compute default SL/TP prices with correct symbol precision
         if hold_side == "long":
-            default_sl = round(entry * 0.985, 4)   # 1.5% below entry
-            default_tp = round(entry * 1.030, 4)   # 3.0% above entry
+            default_sl = round_price(symbol, entry * 0.985)   # 1.5% below entry
+            default_tp = round_price(symbol, entry * 1.030)   # 3.0% above entry
         else:
-            default_sl = round(entry * 1.015, 4)   # 1.5% above entry
-            default_tp = round(entry * 0.970, 4)   # 3.0% below entry
+            default_sl = round_price(symbol, entry * 1.015)   # 1.5% above entry
+            default_tp = round_price(symbol, entry * 0.970)   # 3.0% below entry
 
         if not has_sl:
             log.info(f"Guardian: placing SL for {symbol} {hold_side} @ {default_sl}")
