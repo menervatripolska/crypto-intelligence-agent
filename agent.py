@@ -428,6 +428,130 @@ def fetch_positions() -> list:
     return result
 
 
+def analyze_historical_patterns(symbol: str, deep: dict) -> dict:
+    """
+    Compute real statistical patterns from already-fetched 1H candle data.
+    Candle format: [ts, open, high, low, close, volume] oldest-first.
+    Returns a compact dict that goes straight into the Claude payload.
+    """
+    candles = deep.get("candles_1h") or []
+    if len(candles) < 10:
+        return {"error": "insufficient_candles", "count": len(candles)}
+
+    # Parse into typed arrays
+    opens   = [sf(c[1]) for c in candles]
+    highs   = [sf(c[2]) for c in candles]
+    lows    = [sf(c[3]) for c in candles]
+    closes  = [sf(c[4]) for c in candles]
+    volumes = [sf(c[5]) for c in candles]
+    n       = len(closes)
+    cur_price = closes[-1]
+
+    patterns = {}
+
+    # ── 1. FUNDING BIAS PATTERN
+    # We don't have per-candle funding in the candle array, so we approximate:
+    # use candle direction as a proxy for funding pressure (bearish candles often
+    # correlate with negative funding). Instead use the live funding_rate we already
+    # fetch and check how often bearish candles follow bearish candles (momentum proxy).
+    funding_info = deep.get("funding_rate") or {}
+    funding_val  = sf(funding_info.get("funding_rate", funding_info.get("fundingRate", 0)))
+    funding_sign = "negative" if funding_val < 0 else "positive"
+
+    # Count bearish-then-bearish sequences in last 20 candles (funding momentum proxy)
+    window = min(20, n - 1)
+    bear_after_bear = 0
+    bear_triggers   = 0
+    for i in range(n - window - 1, n - 1):
+        if closes[i] < opens[i]:          # candle i is bearish
+            bear_triggers += 1
+            if closes[i + 1] < opens[i + 1]:   # next candle also bearish
+                bear_after_bear += 1
+    pct1 = round(bear_after_bear / bear_triggers * 100) if bear_triggers else 0
+    patterns["funding_bias"] = {
+        "current_funding": funding_val,
+        "funding_sign":    funding_sign,
+        "bearish_continuation_20c": f"{bear_after_bear}/{bear_triggers} ({pct1}%)",
+        "note": "bearish candle → next candle also bearish"
+    }
+
+    # ── 2. RESISTANCE REJECTION PATTERN
+    # Count how many times price touched current level ±0.5% and reversed in last 100 candles
+    band    = cur_price * 0.005
+    touches = 0
+    rejects = 0
+    for i in range(max(0, n - 100), n - 1):
+        hi, lo = highs[i], lows[i]
+        touched_level = lo <= cur_price + band and hi >= cur_price - band
+        if touched_level:
+            touches += 1
+            # Rejection: close is opposite side of the touch
+            if hi >= cur_price and closes[i] < cur_price:   # touched high, closed below
+                rejects += 1
+            elif lo <= cur_price and closes[i] > cur_price:  # touched low, closed above
+                rejects += 1
+    pct2 = round(rejects / touches * 100) if touches else 0
+    patterns["resistance_rejection"] = {
+        "level":   round(cur_price, 4),
+        "band_pct": "±0.5%",
+        "touches_last_100c": touches,
+        "rejections": rejects,
+        "rejection_rate": f"{rejects}/{touches} ({pct2}%)"
+    }
+
+    # ── 3. MOMENTUM CONTINUATION PATTERN
+    # If last 5 candles have 3+ same direction, how often does next candle continue?
+    def candle_dir(i): return 1 if closes[i] >= opens[i] else -1
+
+    continuation_samples = 0
+    continuation_hits    = 0
+    for i in range(4, n - 1):
+        dirs = [candle_dir(j) for j in range(i - 4, i + 1)]
+        bull_count = dirs.count(1)
+        bear_count = dirs.count(-1)
+        if bull_count >= 3 or bear_count >= 3:
+            dominant = 1 if bull_count >= 3 else -1
+            continuation_samples += 1
+            if candle_dir(i + 1) == dominant:
+                continuation_hits += 1
+    pct3 = round(continuation_hits / continuation_samples * 100) if continuation_samples else 0
+
+    last5_dirs   = [candle_dir(i) for i in range(n - 5, n)]
+    last5_bull   = last5_dirs.count(1)
+    last5_bear   = last5_dirs.count(-1)
+    current_streak = "bullish" if last5_bull >= 3 else ("bearish" if last5_bear >= 3 else "mixed")
+    patterns["momentum"] = {
+        "last_5_candles":  f"{last5_bull} bullish / {last5_bear} bearish",
+        "current_bias":    current_streak,
+        "continuation_rate": f"{continuation_hits}/{continuation_samples} ({pct3}%)",
+        "note": "3+ same-direction candles → next candle same direction"
+    }
+
+    # ── 4. VOLUME PATTERN
+    vol_avg20    = sum(volumes[-20:]) / min(20, len(volumes)) if volumes else 0
+    vol_current  = volumes[-1] if volumes else 0
+    vol_ratio    = round(vol_current / vol_avg20, 2) if vol_avg20 else 0
+    vol_label    = "HIGH" if vol_ratio > 1.5 else ("LOW" if vol_ratio < 0.5 else "NORMAL")
+
+    # High-volume candles: how often does move continue next candle?
+    hi_vol_continues = 0
+    hi_vol_total     = 0
+    for i in range(1, n - 1):
+        avg = sum(volumes[max(0, i - 20):i]) / min(20, i) if i > 0 else 0
+        if avg and volumes[i] > avg * 1.5:
+            hi_vol_total += 1
+            if candle_dir(i + 1) == candle_dir(i):
+                hi_vol_continues += 1
+    pct4 = round(hi_vol_continues / hi_vol_total * 100) if hi_vol_total else 0
+    patterns["volume"] = {
+        "current_vs_avg20": f"{vol_ratio}x ({vol_label})",
+        "high_vol_continuation": f"{hi_vol_continues}/{hi_vol_total} ({pct4}%)",
+        "note": "high-volume candle → next candle same direction"
+    }
+
+    return {"symbol": symbol, "candles_analyzed": n, "patterns": patterns}
+
+
 def collect_deep_data(symbol: str) -> dict:
     """All per-symbol deep data. Each fetch is isolated — failures stored as None."""
     result = {}
@@ -498,11 +622,19 @@ def collect_all_market_data(open_symbols: set) -> dict:
         if sym:
             deep_data[sym] = collect_deep_data(sym)
 
+    # Compute historical patterns for each deep-data symbol
+    patterns = {}
+    for sym, deep in deep_data.items():
+        if deep:
+            patterns[sym] = analyze_historical_patterns(sym, deep)
+    log.info(f"Historical patterns computed for: {list(patterns.keys())}")
+
     return {
-        "total_pairs":    len(tickers),
-        "ticker_summary": ticker_summary,
-        "deep_data":      deep_data,
-        "collected_at":   datetime.now(timezone.utc).isoformat(),
+        "total_pairs":         len(tickers),
+        "ticker_summary":      ticker_summary,
+        "deep_data":           deep_data,
+        "historical_patterns": patterns,
+        "collected_at":        datetime.now(timezone.utc).isoformat(),
     }
 
 
@@ -513,6 +645,14 @@ def collect_all_market_data(open_symbols: set) -> dict:
 SYSTEM_PROMPT = """You are a senior quantitative trader and risk manager with deep expertise in crypto derivatives, market microstructure, behavioral finance and probability theory. You have traded through every major crypto cycle. Your edge is probabilistic thinking and ruthless discipline.
 
 Your singular goal: grow this account through high-probability profitable trades.
+
+CRITICAL — HISTORICAL PATTERNS:
+The payload contains a "historical_patterns" section with REAL computed statistics derived from actual price history — not estimates, not guesses. These are measured frequencies:
+- Funding bias: how often bearish candles follow bearish candles
+- Resistance rejection: how often price reverses at the current level
+- Momentum continuation: how often 3+ consecutive candles continue vs reverse
+- Volume patterns: how often high-volume moves continue
+Your confidence score MUST be derived from these statistics. If the patterns show 70% continuation and you are going long on momentum, your confidence should be near 0.70. Do not override these numbers with gut feel. If patterns conflict (e.g. momentum bullish but rejection rate high), lower confidence and size accordingly.
 
 YOUR FREEDOMS — these are not restrictions, they are your tools:
 
@@ -651,13 +791,14 @@ def ask_claude(market_data: dict, account: dict, positions: list, analytics: dic
     compact_analytics["trade_columns"] = ["symbol","side","entry","exit","pnl_usdt","pnl_pct","hours","outcome"]
 
     payload = {
-        "cycle":              cycle,
-        "ts":                 datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
-        "account":            account,
-        "open_positions":     positions,
-        "open_trades_memory": memory.get("open_trades", {}),
-        "analytics":          compact_analytics,
-        "market":             _strip_nulls(market_data),
+        "cycle":               cycle,
+        "ts":                  datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+        "account":             account,
+        "open_positions":      positions,
+        "open_trades_memory":  memory.get("open_trades", {}),
+        "analytics":           compact_analytics,
+        "historical_patterns": market_data.get("historical_patterns", {}),
+        "market":              _strip_nulls({k: v for k, v in market_data.items() if k != "historical_patterns"}),
     }
 
     user_msg = json.dumps(payload, separators=(",", ":"), default=str)
