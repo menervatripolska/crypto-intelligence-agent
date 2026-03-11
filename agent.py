@@ -1686,9 +1686,10 @@ def sync_positions(memory: dict, live_positions: list):
 
 class DashboardHandler(BaseHTTPRequestHandler):
     ROUTES = {
-        "/":          ("text/html",             lambda: _index_html()),
+        "/":          ("text/html",                    lambda: _index_html()),
         "/log":       ("text/markdown; charset=utf-8", lambda: _read_file(LOG_FILE)),
-        "/memory":    ("application/json",      lambda: _read_file(MEMORY_FILE)),
+        "/log/text":  ("text/plain; charset=utf-8",    lambda: _read_file(LOG_FILE)),
+        "/memory":    ("application/json",             lambda: _read_file(MEMORY_FILE)),
     }
 
     def do_GET(self):
