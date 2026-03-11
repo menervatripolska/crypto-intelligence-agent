@@ -422,6 +422,7 @@ def fetch_positions() -> list:
                 "margin":            sf(p.get("margin")),
                 "liquidation_price": sf(p.get("liquidationPrice")),
                 "pos_id":            p.get("posId", ""),
+                "margin_mode":       p.get("marginMode", "crossed"),
             })
     log.info(f"fetch_positions filtered result: {[(p['symbol'], p['side'], p['size']) for p in result]}")
     return result
@@ -805,14 +806,106 @@ def execute_close(action: dict, positions: list, memory: dict) -> bool:
 
     pos = next((p for p in positions if p["symbol"] == symbol and p["side"] == side), None)
     if not pos:
-        log.warning(f"No open position found for {symbol} {side}")
+        log.warning(f"execute_close: no live position for {symbol} {side!r}. Live: {[(p['symbol'], p['side']) for p in positions]}")
         return False
 
-    close_size = round(sf(pos["available_size"]) * close_pct, 4)
-    api_side   = SIDE_TO_CLOSE[side]
-    # One-way mode: plain market order with no tradeSide/holdSide/reduceOnly
-    log.info(f"CLOSE {close_pct*100:.0f}% of {side.upper()} {symbol}: side={api_side} size={close_size} (raw market, no tradeSide)")
-    place_order(symbol, api_side, "close", close_size, raw_close=True)
+    close_size  = round(sf(pos["available_size"]) * close_pct, 4)
+    api_side    = SIDE_TO_CLOSE[side]          # "sell" for long, "buy" for short
+    margin_mode = pos.get("margin_mode", "crossed")
+    log.info(f"execute_close: {symbol} {side} size={close_size} api_side={api_side} margin_mode={margin_mode}")
+
+    # ── Attempt 1: dedicated close-positions endpoint (handles hedge/one-way automatically)
+    def attempt_close_positions() -> bool:
+        try:
+            body = {
+                "symbol":      symbol,
+                "productType": PRODUCT_TYPE,
+                "holdSide":    side,
+            }
+            log.info(f"Close attempt 1 — close-positions: {body}")
+            bg_post("/api/v2/mix/order/close-positions", body)
+            log.info("Close attempt 1 SUCCEEDED (close-positions)")
+            return True
+        except Exception as e:
+            log.warning(f"Close attempt 1 FAILED: {e}")
+            return False
+
+    # ── Attempt 2: place-order with actual marginMode from position
+    def attempt_place_order_real_margin() -> bool:
+        try:
+            body = {
+                "symbol":      symbol,
+                "productType": PRODUCT_TYPE,
+                "marginMode":  margin_mode,
+                "marginCoin":  "USDT",
+                "size":        str(close_size),
+                "side":        api_side,
+                "tradeSide":   "close",
+                "orderType":   "market",
+            }
+            log.info(f"Close attempt 2 — place-order (marginMode={margin_mode}): {body}")
+            bg_post("/api/v2/mix/order/place-order", body)
+            log.info(f"Close attempt 2 SUCCEEDED (place-order marginMode={margin_mode})")
+            return True
+        except Exception as e:
+            log.warning(f"Close attempt 2 FAILED: {e}")
+            return False
+
+    # ── Attempt 3: place-order with marginMode="isolated" (if position was isolated)
+    def attempt_place_order_isolated() -> bool:
+        if margin_mode == "isolated":
+            log.info("Close attempt 3 skipped (same as attempt 2, already isolated)")
+            return False
+        try:
+            body = {
+                "symbol":      symbol,
+                "productType": PRODUCT_TYPE,
+                "marginMode":  "isolated",
+                "marginCoin":  "USDT",
+                "size":        str(close_size),
+                "side":        api_side,
+                "tradeSide":   "close",
+                "orderType":   "market",
+            }
+            log.info(f"Close attempt 3 — place-order (marginMode=isolated): {body}")
+            bg_post("/api/v2/mix/order/place-order", body)
+            log.info("Close attempt 3 SUCCEEDED (place-order isolated)")
+            return True
+        except Exception as e:
+            log.warning(f"Close attempt 3 FAILED: {e}")
+            return False
+
+    # ── Attempt 4: place-order with reduceOnly=true, no tradeSide
+    def attempt_reduce_only() -> bool:
+        try:
+            body = {
+                "symbol":      symbol,
+                "productType": PRODUCT_TYPE,
+                "marginMode":  margin_mode,
+                "marginCoin":  "USDT",
+                "size":        str(close_size),
+                "side":        api_side,
+                "orderType":   "market",
+                "reduceOnly":  True,
+            }
+            log.info(f"Close attempt 4 — reduceOnly: {body}")
+            bg_post("/api/v2/mix/order/place-order", body)
+            log.info("Close attempt 4 SUCCEEDED (reduceOnly)")
+            return True
+        except Exception as e:
+            log.warning(f"Close attempt 4 FAILED: {e}")
+            return False
+
+    succeeded = (
+        attempt_close_positions() or
+        attempt_place_order_real_margin() or
+        attempt_place_order_isolated() or
+        attempt_reduce_only()
+    )
+
+    if not succeeded:
+        log.error(f"execute_close: ALL 4 attempts failed for {symbol} {side}")
+        return False
 
     if close_pct >= 0.99:
         key = f"{symbol}_{side}"
