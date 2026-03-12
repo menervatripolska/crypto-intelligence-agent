@@ -1673,11 +1673,27 @@ def sync_positions(memory: dict, live_positions: list):
                 "reasoning":   "pre-existing or externally opened position",
             })
 
-    # Update last known mark price for all open positions
+    # Update last known mark price and track peak PnL for all open positions
+    now_iso = datetime.now(timezone.utc).isoformat()
     for p in live_positions:
         key = f"{p['symbol']}_{p['side']}"
         if key in memory.get("open_trades", {}):
-            memory["open_trades"][key]["last_mark_price"] = p.get("mark_price")
+            trade = memory["open_trades"][key]
+            trade["last_mark_price"] = p.get("mark_price")
+            # Ensure open_time is set (alias for opened_at)
+            if "open_time" not in trade:
+                trade["open_time"] = trade.get("opened_at", now_iso)
+            # Peak PnL tracking
+            try:
+                current_pnl = sf(p.get("unrealized_pnl", 0.0))
+                if "peak_pnl" not in trade:
+                    trade["peak_pnl"] = current_pnl
+                    trade["peak_pnl_time"] = now_iso
+                elif current_pnl > sf(trade.get("peak_pnl", 0.0)):
+                    trade["peak_pnl"] = current_pnl
+                    trade["peak_pnl_time"] = now_iso
+            except Exception as e:
+                log.warning(f"Peak PnL update failed for {key}: {e}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1760,6 +1776,32 @@ def trading_loop():
             log.info(f"Open positions: {len(positions)}")
 
             sync_positions(memory, positions)
+
+            # Enrich positions with peak PnL / drawdown context for Claude
+            try:
+                now_dt = datetime.now(timezone.utc)
+                for p in positions:
+                    key = f"{p['symbol']}_{p['side']}"
+                    trade_mem = memory.get("open_trades", {}).get(key, {})
+                    current_pnl = sf(p.get("unrealized_pnl", 0.0))
+                    peak_pnl = sf(trade_mem.get("peak_pnl", current_pnl))
+                    drawdown_from_peak = max(0.0, peak_pnl - current_pnl)
+                    drawdown_pct = (drawdown_from_peak / peak_pnl * 100) if peak_pnl > 0 else 0.0
+                    hours_in_position = 0.0
+                    open_time = trade_mem.get("open_time", trade_mem.get("opened_at", ""))
+                    if open_time:
+                        try:
+                            open_dt = datetime.fromisoformat(open_time.replace("Z", "+00:00"))
+                            hours_in_position = (now_dt - open_dt).total_seconds() / 3600
+                        except Exception:
+                            pass
+                    p["peak_pnl_context"] = (
+                        f"peak_pnl: ${peak_pnl:.2f} | "
+                        f"drawdown_from_peak: ${drawdown_from_peak:.2f} ({drawdown_pct:.1f}%) | "
+                        f"in_position: {hours_in_position:.1f}h"
+                    )
+            except Exception as e:
+                log.warning(f"Peak PnL enrichment failed (non-fatal): {e}")
 
             # Guardian: ensure every open position has SL+TP before Claude runs
             if positions:
