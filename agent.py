@@ -1777,31 +1777,47 @@ def trading_loop():
 
             sync_positions(memory, positions)
 
-            # Enrich positions with peak PnL / drawdown context for Claude
+            # Enrich positions with peak PnL / drawdown data (position_peaks store)
             try:
+                peaks = memory.setdefault("position_peaks", {})
                 now_dt = datetime.now(timezone.utc)
+                now_iso = now_dt.isoformat()
                 for p in positions:
-                    key = f"{p['symbol']}_{p['side']}"
-                    trade_mem = memory.get("open_trades", {}).get(key, {})
-                    current_pnl = sf(p.get("unrealized_pnl", 0.0))
-                    peak_pnl = sf(trade_mem.get("peak_pnl", current_pnl))
-                    drawdown_from_peak = max(0.0, peak_pnl - current_pnl)
-                    drawdown_pct = (drawdown_from_peak / peak_pnl * 100) if peak_pnl > 0 else 0.0
-                    hours_in_position = 0.0
-                    open_time = trade_mem.get("open_time", trade_mem.get("opened_at", ""))
-                    if open_time:
+                    try:
+                        key = f"{p['symbol']}_{p['side']}"
+                        current_pnl = sf(p.get("unrealized_pnl", 0.0))
+                        rec = peaks.setdefault(key, {})
+                        # Set open_time on first encounter, fall back to open_trades
+                        if "open_time" not in rec:
+                            rec["open_time"] = (
+                                memory.get("open_trades", {}).get(key, {}).get("opened_at", now_iso)
+                            )
+                        # Update peak
+                        if "peak_pnl" not in rec:
+                            rec["peak_pnl"] = current_pnl
+                            rec["peak_pnl_time"] = now_iso
+                        elif current_pnl > sf(rec["peak_pnl"]):
+                            rec["peak_pnl"] = current_pnl
+                            rec["peak_pnl_time"] = now_iso
+                        # Compute derived fields
+                        peak_pnl = sf(rec["peak_pnl"])
+                        drawdown_from_peak = round(max(0.0, peak_pnl - current_pnl), 4)
+                        drawdown_pct = round(drawdown_from_peak / peak_pnl * 100, 2) if peak_pnl > 0 else 0.0
+                        hours_in_position = 0.0
                         try:
-                            open_dt = datetime.fromisoformat(open_time.replace("Z", "+00:00"))
-                            hours_in_position = (now_dt - open_dt).total_seconds() / 3600
+                            open_dt = datetime.fromisoformat(rec["open_time"].replace("Z", "+00:00"))
+                            hours_in_position = round((now_dt - open_dt).total_seconds() / 3600, 2)
                         except Exception:
                             pass
-                    p["peak_pnl_context"] = (
-                        f"peak_pnl: ${peak_pnl:.2f} | "
-                        f"drawdown_from_peak: ${drawdown_from_peak:.2f} ({drawdown_pct:.1f}%) | "
-                        f"in_position: {hours_in_position:.1f}h"
-                    )
+                        # Attach to position dict for Claude
+                        p["peak_pnl"]          = round(peak_pnl, 4)
+                        p["drawdown_from_peak"] = drawdown_from_peak
+                        p["drawdown_pct"]       = drawdown_pct
+                        p["hours_in_position"]  = hours_in_position
+                    except Exception as e:
+                        log.warning(f"Peak PnL enrichment skipped for {p.get('symbol')}: {e}")
             except Exception as e:
-                log.warning(f"Peak PnL enrichment failed (non-fatal): {e}")
+                log.warning(f"Peak PnL block failed (non-fatal): {e}")
 
             # Guardian: ensure every open position has SL+TP before Claude runs
             if positions:
