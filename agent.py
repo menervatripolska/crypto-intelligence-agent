@@ -1435,6 +1435,20 @@ def execute_close(action: dict, positions: list, memory: dict) -> bool:
     side      = action.get("close_side") or action.get("side", "")
     close_pct = float(action.get("close_pct", 1.0))
 
+    # If side is missing, infer from live positions for this symbol
+    if not side:
+        sym_positions = [p for p in positions if p["symbol"] == symbol]
+        if len(sym_positions) == 1:
+            side = sym_positions[0]["side"]
+            log.info(f"execute_close: side not specified, inferred {side!r} from single open position")
+        elif len(sym_positions) > 1:
+            log.info(f"execute_close: side not specified and {len(sym_positions)} positions open for {symbol} — closing all")
+            results = [execute_close({**action, "side": p["side"]}, positions, memory) for p in sym_positions]
+            return any(results)
+        else:
+            log.warning(f"execute_close: side not specified and no live position for {symbol}")
+            return False
+
     pos = next((p for p in positions if p["symbol"] == symbol and p["side"] == side), None)
     if not pos:
         log.warning(f"execute_close: no live position for {symbol} {side!r}. Live: {[(p['symbol'], p['side']) for p in positions]}")
