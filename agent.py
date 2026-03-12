@@ -1657,6 +1657,12 @@ def sync_positions(memory: dict, live_positions: list):
         # Try to get last mark price from position; fall back to entry
         exit_px = sf(trade.get("last_mark_price", trade.get("entry_price")))
         record_closed_trade(memory, key, exit_px, reason="closed externally (TP/SL/manual)")
+        # Generate episodic lesson for externally-closed trade
+        try:
+            if memory.get("trades"):
+                save_trade_memory(memory["trades"][-1])
+        except Exception as e:
+            log.warning(f"save_trade_memory (external close) failed (non-fatal): {e}")
 
     # New positions not yet tracked
     for p in live_positions:
@@ -1756,6 +1762,42 @@ def _index_html() -> str:
 def trading_loop():
     memory   = load_memory()
     cycle    = 0
+
+    # ── Startup diagnostics ────────────────────────────────────────────────────
+    peaks = memory.get("position_peaks", {})
+    log.info(f"[STARTUP] memory.json loaded | path={MEMORY_FILE}")
+    log.info(f"[STARTUP] position_peaks: {len(peaks)} entries | keys={list(peaks.keys())}")
+    for k, v in peaks.items():
+        log.info(
+            f"[STARTUP]   {k}: peak_pnl={v.get('peak_pnl')} "
+            f"peak_pnl_time={v.get('peak_pnl_time')} "
+            f"open_time={v.get('open_time')}"
+        )
+
+    em_path = EPISODIC_MEMORY_FILE
+    em_exists = em_path.exists()
+    em_size   = em_path.stat().st_size if em_exists else 0
+    log.info(f"[STARTUP] episodic_memory.json: exists={em_exists} size={em_size}B path={em_path}")
+    if em_exists:
+        try:
+            em_data  = json.loads(em_path.read_text(encoding="utf-8"))
+            memories = em_data.get("memories", [])
+            log.info(f"[STARTUP] episodic_memory: {len(memories)} lessons stored")
+            for m in memories[-3:]:   # last 3 for brevity
+                log.info(
+                    f"[STARTUP]   [{m.get('timestamp','')}] "
+                    f"{m.get('symbol')} {m.get('side')} pnl={m.get('pnl')} | "
+                    f"situation={str(m.get('situation',''))[:80]}"
+                )
+        except Exception as e:
+            log.error(f"[STARTUP] episodic_memory.json read failed: {e}")
+    else:
+        log.warning(
+            f"[STARTUP] episodic_memory.json does NOT exist — lessons are generated only "
+            f"when trades close via execute_close() or sync_positions(). "
+            f"Closed trades in memory.json: {len(memory.get('trades', []))}"
+        )
+    # ── End startup diagnostics ────────────────────────────────────────────────
 
     log.info("Startup sync: fetching live positions...")
     live_positions = fetch_positions()
