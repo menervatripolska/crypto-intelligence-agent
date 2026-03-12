@@ -1574,6 +1574,9 @@ def execute_add(action: dict, account: dict, memory: dict) -> bool:
 def _dispatch(action: dict, account: dict, positions: list, memory: dict):
     """Dispatch a single action dict."""
     verb = action.get("action", "WAIT")
+    if verb in ("LONG", "SHORT"):
+        action = {**action, "action": "OPEN", "side": verb.lower()}
+        verb = "OPEN"
     if verb == "OPEN":
         execute_open(action, account, memory)
     elif verb in ("CLOSE", "PARTIAL_CLOSE"):
