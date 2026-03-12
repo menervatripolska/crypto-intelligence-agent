@@ -1131,6 +1131,46 @@ def _compact_trade(t: dict) -> list:
     ]
 
 
+def _format_open_positions(positions: list, peaks: dict) -> str:
+    """Return a human-readable block for open positions including peak PnL data."""
+    if not positions:
+        return "None"
+    lines = []
+    for p in positions:
+        sym   = p.get("symbol", "?")
+        side  = p.get("side", "?")
+        size  = p.get("size", 0)
+        entry = p.get("entry_price", 0)
+        pnl   = sf(p.get("unrealized_pnl", 0))
+        sign  = "+" if pnl >= 0 else ""
+        line  = f"{sym} {side} | size: {size} | entry: {entry} | pnl: {sign}${pnl:.2f}"
+        # Peak PnL — prefer fields already enriched onto the dict, fall back to peaks store
+        key          = f"{sym}_{side}"
+        peak_pnl     = p.get("peak_pnl")
+        drawdown     = p.get("drawdown_from_peak")
+        drawdown_pct = p.get("drawdown_pct")
+        hours        = p.get("hours_in_position")
+        if peak_pnl is None:
+            rec = peaks.get(key, {})
+            if rec.get("peak_pnl") is not None:
+                peak_pnl     = sf(rec["peak_pnl"])
+                drawdown     = round(max(0.0, peak_pnl - pnl), 4)
+                drawdown_pct = round(drawdown / peak_pnl * 100, 2) if peak_pnl > 0 else 0.0
+                try:
+                    open_dt = datetime.fromisoformat(rec["open_time"].replace("Z", "+00:00"))
+                    hours   = round((datetime.now(timezone.utc) - open_dt).total_seconds() / 3600, 2)
+                except Exception:
+                    hours = None
+        if peak_pnl is not None:
+            line += (
+                f"\n  ⚠️ peak_pnl: ${sf(peak_pnl):.2f}"
+                f" | drawdown_from_peak: ${sf(drawdown):.2f} ({sf(drawdown_pct):.1f}%)"
+                f" | in_position: {sf(hours):.1f}h"
+            )
+        lines.append(line)
+    return "\n".join(lines)
+
+
 def ask_claude(market_data: dict, account: dict, positions: list, analytics: dict, memory: dict, cycle: int, market_intelligence: dict = None) -> dict:
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
@@ -1166,7 +1206,7 @@ def ask_claude(market_data: dict, account: dict, positions: list, analytics: dic
         "cycle":                cycle,
         "ts":                   datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
         "account":              account,
-        "open_positions":       positions,
+        "open_positions":       _format_open_positions(positions, memory.get("position_peaks", {})),
         "open_trades_memory":   memory.get("open_trades", {}),
         "analytics":            compact_analytics,
         "historical_patterns":  market_data.get("historical_patterns", {}),
