@@ -1,0 +1,41 @@
+# Environment & secrets
+.env
+.env.*
+*.env
+
+# Agent runtime data (Railway Volume — not for git)
+/data/
+memory.json
+episodic_memory.json
+agent_log.md
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs & backups
+*.log
+*.bak
+*.json.bak
